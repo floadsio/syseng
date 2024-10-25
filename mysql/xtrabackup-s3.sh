@@ -37,7 +37,7 @@
 
 CFG_EXTRA_LSN_DIR="/var/backups/mysql_lsn"
 CFG_HOSTNAME=$(hostname)
-CFG_DATE=$(date -I)
+CFG_DATE=$(date +%Y-%m-%d_%H-%M-%S)
 CFG_TIMESTAMP=$(date +%s)
 CFG_INCREMENTAL=""
 
@@ -60,7 +60,7 @@ if [ "${OPT_BACKUP_TYPE}" = "full" ] || [ "${OPT_BACKUP_TYPE}" = "inc" ]; then
 
     if [ "${OPT_BACKUP_TYPE}" = "inc" ]; then
         if [ ! -f "${CFG_EXTRA_LSN_DIR}/xtrabackup_checkpoints" ]; then
-            echo "No previous full backup found. Please run a full backup first."
+            echo "No previous full backup found. Please run a full backup first"
             exit 1
         fi
         CFG_INCREMENTAL="--incremental-basedir=${CFG_EXTRA_LSN_DIR}"
@@ -68,17 +68,17 @@ if [ "${OPT_BACKUP_TYPE}" = "full" ] || [ "${OPT_BACKUP_TYPE}" = "inc" ]; then
 
     if [ -n "${OPT_DRY_RUN}" ]; then
         echo "Dry run: xtrabackup --backup ${CFG_INCREMENTAL} --extra-lsndir=${CFG_EXTRA_LSN_DIR} --stream=xbstream --target-dir=${CFG_EXTRA_LSN_DIR} | \
-    xbcloud put ${CFG_HOSTNAME}/${CFG_DATE}-${OPT_BACKUP_TYPE}_${CFG_TIMESTAMP}"
+    xbcloud put ${CFG_HOSTNAME}/${CFG_DATE}_${OPT_BACKUP_TYPE}_${CFG_TIMESTAMP}"
     else
         xtrabackup --backup ${CFG_INCREMENTAL} --extra-lsndir=${CFG_EXTRA_LSN_DIR} --stream=xbstream --target-dir=${CFG_EXTRA_LSN_DIR} | \
-    xbcloud put ${CFG_HOSTNAME}/${CFG_DATE}-${OPT_BACKUP_TYPE}_${CFG_TIMESTAMP}
+    xbcloud put ${CFG_HOSTNAME}/${CFG_DATE}_${OPT_BACKUP_TYPE}_${CFG_TIMESTAMP}
 
         if [ $? -ne 0 ]; then
             echo "Backup failed!"
             exit 1
         fi
 
-        echo "Backup completed successfully."
+        echo `date '+%Y-%m-%d %H:%M:%S:%s'`": Backup completed successfully"
     fi
 
 # we restore
