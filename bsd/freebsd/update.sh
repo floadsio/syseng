@@ -33,6 +33,10 @@ if [ $DRY_RUN -eq 1 ]; then
     pkg upgrade -n
     echo "Previewing FreeBSD update fetch..."
     freebsd-update fetch
+    echo "Previewing package autoremove..."
+    pkg autoremove -n
+    echo "Previewing package clean-up..."
+    pkg clean -n
     echo "Dry-run completed."
     exit 0
 fi
@@ -43,6 +47,12 @@ pkg update -f
 
 echo "Upgrading packages..."
 pkg upgrade -y
+
+echo "Removing unnecessary packages..."
+pkg autoremove -y
+
+echo "Cleaning up package cache..."
+pkg clean -a -y
 
 echo "Fetching and installing FreeBSD updates..."
 freebsd-update fetch install
