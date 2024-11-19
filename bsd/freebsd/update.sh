@@ -1,6 +1,7 @@
 #!/bin/sh
 
 PAGER=cat
+IGNORE_OSVERSION=yes
 DRY_RUN=0
 
 # Function to display usage information
