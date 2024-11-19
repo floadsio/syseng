@@ -7,15 +7,15 @@ DRY_RUN=0
 
 # Function to display usage information
 usage() {
-    echo "Usage: $0 [--dry-run]"
-    echo "  --dry-run   Simulate updates without applying them"
+    echo "Usage: $0 [--dry-run | -n]"
+    echo "  --dry-run, -n   Simulate updates without applying them"
     exit 1
 }
 
 # Parse command-line arguments
 for arg in "$@"; do
     case $arg in
-        --dry-run)
+        --dry-run|-n)
             DRY_RUN=1
             ;;
         *)
@@ -28,7 +28,7 @@ done
 if [ $DRY_RUN -eq 1 ]; then
     echo "Dry-run mode enabled. No changes will be made."
     echo "Fetching package updates..."
-    pkg update -f
+    pkg update -n -f
     echo "Previewing package upgrades..."
     pkg upgrade -n
     echo "Previewing FreeBSD update fetch..."
