@@ -28,7 +28,7 @@ done
 if [ $DRY_RUN -eq 1 ]; then
     echo "Dry-run mode enabled. No changes will be made."
     echo "Fetching package updates..."
-    yes | pkg update -f
+    pkg update -f
     echo "Previewing package upgrades..."
     pkg upgrade -n
     echo "Previewing FreeBSD update fetch..."
@@ -39,7 +39,7 @@ fi
 
 # Actual update process
 echo "Updating package repository..."
-yes | pkg update -f
+pkg update -f
 
 echo "Upgrading packages..."
 pkg upgrade -y
