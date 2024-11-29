@@ -31,41 +31,41 @@ update_jails() {
         if [ -n "$jail" ]; then
             if [ "$DRY_RUN" -eq 1 ]; then
                 echo "Previewing update for jail: $jail"
-                sudo bastille cmd "$jail" env PAGER=cat IGNORE_OSVERSION=yes pkg update -n || {
+                sudo bastille cmd "$jail" env PAGER=cat IGNORE_OSVERSION=yes ASSUME_ALWAYS_YES=yes pkg update -n || {
                     echo "Error updating repository for jail $jail in dry-run mode. Skipping."
                     continue
                 }
-                sudo bastille cmd "$jail" env PAGER=cat IGNORE_OSVERSION=yes pkg upgrade -n || {
+                sudo bastille cmd "$jail" env PAGER=cat IGNORE_OSVERSION=yes ASSUME_ALWAYS_YES=yes pkg upgrade -n || {
                     echo "Error previewing package upgrade for jail $jail. Skipping."
                     continue
                 }
                 echo "Previewing autoremove for jail: $jail"
-                sudo bastille cmd "$jail" env PAGER=cat IGNORE_OSVERSION=yes pkg autoremove -n || {
+                sudo bastille cmd "$jail" env PAGER=cat IGNORE_OSVERSION=yes ASSUME_ALWAYS_YES=yes pkg autoremove -n || {
                     echo "Error previewing autoremove for jail $jail. Skipping."
                     continue
                 }
                 echo "Previewing clean for jail: $jail"
-                sudo bastille cmd "$jail" env PAGER=cat IGNORE_OSVERSION=yes pkg clean -n || {
+                sudo bastille cmd "$jail" env PAGER=cat IGNORE_OSVERSION=yes ASSUME_ALWAYS_YES=yes pkg clean -n || {
                     echo "Error previewing clean for jail $jail. Skipping."
                     continue
                 }
             else
                 echo "Updating packages for jail: $jail"
-                sudo bastille cmd "$jail" env PAGER=cat IGNORE_OSVERSION=yes pkg update -f || {
+                sudo bastille cmd "$jail" env PAGER=cat IGNORE_OSVERSION=yes ASSUME_ALWAYS_YES=yes pkg update -f || {
                     echo "Error updating repository for jail $jail. Skipping."
                     continue
                 }
-                sudo bastille cmd "$jail" env PAGER=cat IGNORE_OSVERSION=yes pkg upgrade -y || {
+                sudo bastille cmd "$jail" env PAGER=cat IGNORE_OSVERSION=yes ASSUME_ALWAYS_YES=yes pkg upgrade -y || {
                     echo "Error upgrading packages for jail $jail. Skipping."
                     continue
                 }
                 echo "Removing unnecessary packages for jail: $jail"
-                sudo bastille cmd "$jail" env PAGER=cat IGNORE_OSVERSION=yes pkg autoremove -y || {
+                sudo bastille cmd "$jail" env PAGER=cat IGNORE_OSVERSION=yes ASSUME_ALWAYS_YES=yes pkg autoremove -y || {
                     echo "Error running autoremove for jail $jail. Skipping."
                     continue
                 }
                 echo "Cleaning up package cache for jail: $jail"
-                sudo bastille cmd "$jail" env PAGER=cat IGNORE_OSVERSION=yes pkg clean -a -y || {
+                sudo bastille cmd "$jail" env PAGER=cat IGNORE_OSVERSION=yes ASSUME_ALWAYS_YES=yes pkg clean -a -y || {
                     echo "Error cleaning package cache for jail $jail. Skipping."
                     continue
                 }
