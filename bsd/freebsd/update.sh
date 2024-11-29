@@ -27,7 +27,7 @@ done
 # Function to update Bastille jails
 update_jails() {
     echo "Updating packages in all Bastille jails..."
-    sudo bastille list | awk 'NR > 1 {print $3}' | while read -r jail; do
+    sudo bastille list jail | while read -r jail; do
         if [ -n "$jail" ]; then
             if [ "$DRY_RUN" -eq 1 ]; then
                 echo "Previewing update for jail: $jail"
