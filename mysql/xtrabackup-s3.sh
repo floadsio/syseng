@@ -38,6 +38,7 @@ fi
 
 # Calculate the cutoff date
 CUTOFF_DATE=$(date -d "$CFG_CUTOFF_DAYS days ago" +%Y-%m-%d)
+CUTOFF_SECONDS=$(date -d "$CUTOFF_DATE" +%s)
 
 OPT_BACKUP_TYPE="${1:-}"
 OPT_DRY_RUN=0
@@ -72,16 +73,18 @@ cleanup_old_backups() {
     # Find and process folders
     mc ls "$CFG_BUCKET_PATH" | awk '{print $NF}' | while read -r FOLDER; do
         FOLDER_DATE=$(echo "$FOLDER" | cut -d_ -f1)
+        FOLDER_SECONDS=$(date -d "$FOLDER_DATE" +%s)
 
-        if [ "$FOLDER_DATE" \< "$CUTOFF_DATE" ]; then
+        if [ "$FOLDER_SECONDS" -lt "$CUTOFF_SECONDS" ]; then
             if [ "$OPT_DRY_RUN" -eq 1 ]; then
-                echo "Would delete: $FOLDER"
+                echo "Would delete: $FOLDER (older than $CFG_CUTOFF_DAYS days)"
             else
                 echo "Deleting: $FOLDER"
                 mc rm -r --force "$CFG_BUCKET_PATH/$FOLDER"
             fi
         else
-            echo "$FOLDER is newer"
+            DAYS_WITHIN=$(( (FOLDER_SECONDS - CUTOFF_SECONDS) / 86400 ))
+            echo "$FOLDER is $DAYS_WITHIN days newer than the cutoff date"
         fi
     done
 
