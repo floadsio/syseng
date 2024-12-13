@@ -88,6 +88,11 @@ cleanup_old_backups() {
     echo "Cleanup completed."
 }
 
+generate_report() {
+    echo "Generating backup report..."
+    mc du "$CFG_BUCKET_PATH" | awk '{print "Total Size: " $1 "\nTotal Objects: " $2 "\nPath: " $3}'
+}
+
 # Backup (full or incremental)
 if [ "${OPT_BACKUP_TYPE}" = "full" ] || [ "${OPT_BACKUP_TYPE}" = "inc" ]; then
     if [ ! -d "${CFG_EXTRA_LSN_DIR}" ]; then
@@ -122,6 +127,9 @@ if [ "${OPT_BACKUP_TYPE}" = "full" ] || [ "${OPT_BACKUP_TYPE}" = "inc" ]; then
     if [ "$OPT_CLEANUP" -eq 1 ]; then
         cleanup_old_backups
     fi
+
+    # Generate report
+    generate_report
 
 # Restore backups
 elif [ "${OPT_BACKUP_TYPE}" = "restore" ]; then
