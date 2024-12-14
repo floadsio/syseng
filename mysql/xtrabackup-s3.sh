@@ -113,10 +113,10 @@ if [ "${OPT_BACKUP_TYPE}" = "full" ] || [ "${OPT_BACKUP_TYPE}" = "inc" ]; then
 
     if [ "$OPT_DRY_RUN" -eq 1 ]; then
         echo "Dry run: xtrabackup --backup ${CFG_INCREMENTAL} --extra-lsndir=${CFG_EXTRA_LSN_DIR} --stream=xbstream --target-dir=${CFG_EXTRA_LSN_DIR} | \
-    xbcloud put ${CFG_BUCKET_PATH}${CFG_DATE}_${OPT_BACKUP_TYPE}_${CFG_TIMESTAMP}"
+    xbcloud put ${CFG_BUCKET_PATH}/${CFG_DATE}_${OPT_BACKUP_TYPE}_${CFG_TIMESTAMP}"
     else
         xtrabackup --backup ${CFG_INCREMENTAL} --extra-lsndir=${CFG_EXTRA_LSN_DIR} --stream=xbstream --target-dir=${CFG_EXTRA_LSN_DIR} | \
-    xbcloud put ${CFG_BUCKET_PATH}${CFG_DATE}_${OPT_BACKUP_TYPE}_${CFG_TIMESTAMP}
+    xbcloud put ${CFG_BUCKET_PATH}/${CFG_DATE}_${OPT_BACKUP_TYPE}_${CFG_TIMESTAMP}
 
         if [ $? -ne 0 ]; then
             echo "Backup failed!"
