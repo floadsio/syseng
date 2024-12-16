@@ -70,14 +70,26 @@ cleanup_old_backups() {
     echo "Starting cleanup of old backups..."
 
     # Check if the backup path exists
-    if ! mc ls "$CFG_MC_BUCKET_PATH" >/dev/null 2>&1; then
-        echo "ERROR: Path not found: $CFG_MC_BUCKET_PATH"
+    if ! mc ls "$CFG_BUCKET_PATH" >/dev/null 2>&1; then
+        echo "ERROR: Path not found: $CFG_BUCKET_PATH"
         exit 1
     fi
 
     # Find and process folders
-    mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | while read -r FOLDER; do
+    mc ls "$CFG_BUCKET_PATH" | awk '{print $NF}' | while read -r FOLDER; do
+        # Remove trailing slashes or invalid characters
+        FOLDER=$(echo "$FOLDER" | sed 's:/*$::')
+
+        # Extract the folder date
         FOLDER_DATE=$(echo "$FOLDER" | cut -d_ -f1)
+
+        # Ensure the folder date is a valid date
+        if ! date -d "$FOLDER_DATE" >/dev/null 2>&1; then
+            echo "Skipping invalid folder: $FOLDER"
+            continue
+        fi
+
+        # Convert dates to seconds for comparison
         FOLDER_SECONDS=$(date -d "$FOLDER_DATE" +%s)
 
         if [ "$FOLDER_SECONDS" -lt "$CUTOFF_SECONDS" ]; then
@@ -85,7 +97,7 @@ cleanup_old_backups() {
                 echo "Would delete: $FOLDER (older than $CFG_CUTOFF_DAYS days)"
             else
                 echo "Deleting: $FOLDER"
-                mc rm -r --force "$CFG_MC_BUCKET_PATH/$FOLDER"
+                mc rm -r --force "$CFG_BUCKET_PATH/$FOLDER"
             fi
         else
             DAYS_WITHIN=$(( (FOLDER_SECONDS - CUTOFF_SECONDS) / 86400 ))
