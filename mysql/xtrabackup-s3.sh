@@ -5,7 +5,7 @@
 #
 # % xtrabackup-s3.sh full [--dry-run] [--cleanup]       Make a full backup to S3
 # % xtrabackup-s3.sh inc [--dry-run] [--cleanup]       Make an incremental backup to S3
-# % xtrabackup-s3.sh restore <full-backup> <inc-backup-1> <inc-backup-2>
+# % xtrabackup-s3.sh restore <full-backup> [--dry-run] Restore a full backup from S3
 #
 
 CFG_EXTRA_LSN_DIR="/var/backups/mysql_lsn"
@@ -26,6 +26,11 @@ fi
 . "$CONFIG_FILE"
 
 # Validate mandatory configuration
+if [ -z "$CFG_MC_BUCKET_PATH" ]; then
+    echo "ERROR: CFG_MC_BUCKET_PATH is not set in $CONFIG_FILE."
+    exit 1
+fi
+
 if [ -z "$CFG_BUCKET_PATH" ]; then
     echo "ERROR: CFG_BUCKET_PATH is not set in $CONFIG_FILE."
     exit 1
@@ -36,9 +41,9 @@ if [ -z "$CFG_CUTOFF_DAYS" ]; then
     exit 1
 fi
 
-# Calculate the cutoff date
-CUTOFF_DATE=$(date -d "$CFG_CUTOFF_DAYS days ago" +%Y-%m-%d)
-CUTOFF_SECONDS=$(date -d "$CUTOFF_DATE" +%s)
+# Extract S3 endpoint and encryption key from the configuration
+S3_ENDPOINT=$(awk -F'=' '/^s3-endpoint/ {print $2; exit}' /root/.my.cnf | xargs)
+DECRYPT_KEY=$(awk -F'=' '/^encrypt-key/ {print $2; exit}' /root/.my.cnf | xargs)
 
 OPT_BACKUP_TYPE="${1:-}"
 OPT_DRY_RUN=0
@@ -50,14 +55,14 @@ while [ "$1" != "" ]; do
     case "$1" in
         --dry-run) OPT_DRY_RUN=1 ;;
         --cleanup) OPT_CLEANUP=1 ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
+        *) BACKUP_ARGUMENTS="$BACKUP_ARGUMENTS $1" ;;
     esac
     shift
 done
 
 if [ "${OPT_BACKUP_TYPE}" != "full" ] && [ "${OPT_BACKUP_TYPE}" != "inc" ] && [ "${OPT_BACKUP_TYPE}" != "restore" ]; then
     echo "Usage: $0 {full|inc} [--dry-run] [--cleanup]"
-    echo "       $0 restore <full-backup> <inc-backup-1> <inc-backup-2>"
+    echo "       $0 restore <full-backup> [--dry-run]"
     exit 1
 fi
 
@@ -65,13 +70,13 @@ cleanup_old_backups() {
     echo "Starting cleanup of old backups..."
 
     # Check if the backup path exists
-    if ! mc ls "$CFG_BUCKET_PATH" >/dev/null 2>&1; then
-        echo "ERROR: Path not found: $CFG_BUCKET_PATH"
+    if ! mc ls "$CFG_MC_BUCKET_PATH" >/dev/null 2>&1; then
+        echo "ERROR: Path not found: $CFG_MC_BUCKET_PATH"
         exit 1
     fi
 
     # Find and process folders
-    mc ls "$CFG_BUCKET_PATH" | awk '{print $NF}' | while read -r FOLDER; do
+    mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | while read -r FOLDER; do
         FOLDER_DATE=$(echo "$FOLDER" | cut -d_ -f1)
         FOLDER_SECONDS=$(date -d "$FOLDER_DATE" +%s)
 
@@ -80,7 +85,7 @@ cleanup_old_backups() {
                 echo "Would delete: $FOLDER (older than $CFG_CUTOFF_DAYS days)"
             else
                 echo "Deleting: $FOLDER"
-                mc rm -r --force "$CFG_BUCKET_PATH/$FOLDER"
+                mc rm -r --force "$CFG_MC_BUCKET_PATH/$FOLDER"
             fi
         else
             DAYS_WITHIN=$(( (FOLDER_SECONDS - CUTOFF_SECONDS) / 86400 ))
@@ -93,7 +98,7 @@ cleanup_old_backups() {
 
 generate_report() {
     echo "Generating backup report..."
-    mc du "$CFG_BUCKET_PATH" | awk '{print "Total Size: " $1 "\nTotal Objects: " $2 "\nPath: " $3}'
+    mc du "$CFG_MC_BUCKET_PATH" | awk '{print "Total Size: " $1 "\nTotal Objects: " $2 "\nPath: " $3}'
 }
 
 # Backup (full or incremental)
@@ -136,7 +141,41 @@ if [ "${OPT_BACKUP_TYPE}" = "full" ] || [ "${OPT_BACKUP_TYPE}" = "inc" ]; then
 
 # Restore backups
 elif [ "${OPT_BACKUP_TYPE}" = "restore" ]; then
-    echo "Do a restore..."
+    FULL_BACKUP=$(echo $BACKUP_ARGUMENTS | awk '{print $1}')
+
+    if [ -z "$FULL_BACKUP" ]; then
+        echo "ERROR: No full backup specified for restore."
+        exit 1
+    fi
+
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        echo "Dry run: xbcloud get ${CFG_BUCKET_PATH}/${FULL_BACKUP} --parallel=10 | xbstream -x -C /var/lib/mysql --parallel=8 --decrypt=AES256 --encrypt-key=$DECRYPT_KEY --decompress --decompress-threads=4"
+        exit 0
+    fi
+
+    echo "Stopping MySQL..."
+    systemctl stop mysql
+
+    echo "Clearing /var/lib/mysql..."
+    rm -rf /var/lib/mysql/*
+    mkdir -p /var/lib/mysql
+    chown mysql:mysql /var/lib/mysql
+    chmod 0750 /var/lib/mysql
+
+    echo "Restoring full backup: $FULL_BACKUP"
+    xbcloud get "${CFG_BUCKET_PATH}/${FULL_BACKUP}" --parallel=10 2>download.log | \
+    xbstream -x -C /var/lib/mysql --parallel=8 --decrypt=AES256 --encrypt-key="$DECRYPT_KEY" --decompress --decompress-threads=4
+
+    echo "Preparing restored data..."
+    xtrabackup --prepare --target-dir=/var/lib/mysql
+
+    echo "Fixing permissions..."
+    chown -R mysql:mysql /var/lib/mysql
+
+    echo "Starting MySQL..."
+    systemctl start mysql
+
+    echo "Full backup has been restored successfully."
 fi
 
 exit 0
