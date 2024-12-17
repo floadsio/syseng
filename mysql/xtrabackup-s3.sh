@@ -69,42 +69,45 @@ fi
 cleanup_old_backups() {
     echo "Starting cleanup of old backups..."
 
-    # Validate that the bucket path exists
+    # Check if the backup path exists
     if ! mc ls "$CFG_MC_BUCKET_PATH" >/dev/null 2>&1; then
         echo "ERROR: Path not found: $CFG_MC_BUCKET_PATH"
         exit 1
     fi
 
-    # Iterate through backups and compare against cutoff
-    mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $5}' | while read -r FOLDER; do
-        # Trim trailing slash
-        FOLDER=$(echo "$FOLDER" | sed 's:/$::')
+    # Calculate the cutoff date dynamically based on CFG_CUTOFF_DAYS
+    if [ -z "$CFG_CUTOFF_DAYS" ]; then
+        echo "ERROR: CFG_CUTOFF_DAYS is not set."
+        exit 1
+    fi
+    CUTOFF_DATE=$(date -d "$CFG_CUTOFF_DAYS days ago" +%Y-%m-%d)
+    echo "Cutoff date for cleanup: $CUTOFF_DATE"
 
-        # Extract the folder date and validate
+    # Find and process folders
+    mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | while read -r FOLDER; do
+        # Trim whitespace
+        FOLDER=$(echo "$FOLDER" | xargs)
+
+        # Extract folder date
         FOLDER_DATE=$(echo "$FOLDER" | cut -d_ -f1)
-        if [ -z "$FOLDER_DATE" ]; then
-            echo "Skipping folder with invalid date: $FOLDER"
-            continue
-        fi
 
-        # Convert folder date to seconds since epoch
-        FOLDER_SECONDS=$(date -d "$FOLDER_DATE" +%s 2>/dev/null)
-        if [ -z "$FOLDER_SECONDS" ]; then
-            echo "Skipping folder with unrecognized date format: $FOLDER"
+        # Validate folder date format (YYYY-MM-DD)
+        if ! echo "$FOLDER_DATE" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
+            echo "Skipping folder with invalid date format: $FOLDER"
             continue
         fi
 
         # Compare folder date with cutoff date
-        if [ "$FOLDER_SECONDS" -lt "$CUTOFF_SECONDS" ]; then
+        if [ "$FOLDER_DATE" \< "$CUTOFF_DATE" ]; then
             if [ "$OPT_DRY_RUN" -eq 1 ]; then
-                echo "Would delete: $FOLDER (older than $CFG_CUTOFF_DAYS days)"
+                echo "Would delete: $FOLDER"
             else
                 echo "Deleting: $FOLDER"
                 mc rm -r --force "$CFG_MC_BUCKET_PATH/$FOLDER"
             fi
         else
-            DAYS_NEWER=$(( (FOLDER_SECONDS - CUTOFF_SECONDS) / 86400 ))
-            echo "$FOLDER is $DAYS_NEWER days newer than the cutoff date"
+            DAYS_NEWER=$(( ( $(date -d "$FOLDER_DATE" +%s) - $(date -d "$CUTOFF_DATE" +%s) ) / 86400 ))
+            echo "Folder $FOLDER is $DAYS_NEWER days newer than the cutoff date."
         fi
     done
 
