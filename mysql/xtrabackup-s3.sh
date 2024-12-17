@@ -69,29 +69,32 @@ fi
 cleanup_old_backups() {
     echo "Starting cleanup of old backups..."
 
-    # Check if the backup path exists
+    # Validate that the bucket path exists
     if ! mc ls "$CFG_MC_BUCKET_PATH" >/dev/null 2>&1; then
         echo "ERROR: Path not found: $CFG_MC_BUCKET_PATH"
         exit 1
     fi
 
-    # Find and process folders
-    mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | while read -r FOLDER; do
-        # Remove trailing slashes or invalid characters
-        FOLDER=$(echo "$FOLDER" | sed 's:/*$::')
+    # Iterate through backups and compare against cutoff
+    mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $5}' | while read -r FOLDER; do
+        # Trim trailing slash
+        FOLDER=$(echo "$FOLDER" | sed 's:/$::')
 
-        # Extract the folder date
+        # Extract the folder date and validate
         FOLDER_DATE=$(echo "$FOLDER" | cut -d_ -f1)
-
-        # Ensure the folder date is a valid date
-        if ! date -d "$FOLDER_DATE" >/dev/null 2>&1; then
-            echo "Skipping invalid folder: $FOLDER"
+        if [ -z "$FOLDER_DATE" ]; then
+            echo "Skipping folder with invalid date: $FOLDER"
             continue
         fi
 
-        # Convert dates to seconds for comparison
-        FOLDER_SECONDS=$(date -d "$FOLDER_DATE" +%s)
+        # Convert folder date to seconds since epoch
+        FOLDER_SECONDS=$(date -d "$FOLDER_DATE" +%s 2>/dev/null)
+        if [ -z "$FOLDER_SECONDS" ]; then
+            echo "Skipping folder with unrecognized date format: $FOLDER"
+            continue
+        fi
 
+        # Compare folder date with cutoff date
         if [ "$FOLDER_SECONDS" -lt "$CUTOFF_SECONDS" ]; then
             if [ "$OPT_DRY_RUN" -eq 1 ]; then
                 echo "Would delete: $FOLDER (older than $CFG_CUTOFF_DAYS days)"
@@ -100,8 +103,8 @@ cleanup_old_backups() {
                 mc rm -r --force "$CFG_MC_BUCKET_PATH/$FOLDER"
             fi
         else
-            DAYS_WITHIN=$(( (FOLDER_SECONDS - CUTOFF_SECONDS) / 86400 ))
-            echo "$FOLDER is $DAYS_WITHIN days newer than the cutoff date"
+            DAYS_NEWER=$(( (FOLDER_SECONDS - CUTOFF_SECONDS) / 86400 ))
+            echo "$FOLDER is $DAYS_NEWER days newer than the cutoff date"
         fi
     done
 
