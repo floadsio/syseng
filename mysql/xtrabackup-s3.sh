@@ -99,11 +99,11 @@ cleanup_old_backups() {
 
         # Compare folder date with cutoff date
         if [ "$FOLDER_DATE" \< "$CUTOFF_DATE" ]; then
-            if [ "$OPT_DRY_RUN" -eq 1 ]; then
-                echo "Would delete: $FOLDER"
-            else
                 # Remove trailing slash from the folder name
                 FOLDER_CLEANED=$(echo "$FOLDER" | sed 's:/*$::')
+            if [ "$OPT_DRY_RUN" -eq 1 ]; then
+                echo "Would delete: $FOLDER_CLEANED"
+            else
                 echo "Deleting: $FOLDER_CLEANED"
                 mc rm -r --force "$CFG_MC_BUCKET_PATH/$FOLDER_CLEANED"
             fi
