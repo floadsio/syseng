@@ -156,7 +156,7 @@ if [ "${OPT_BACKUP_TYPE}" = "full" ] || [ "${OPT_BACKUP_TYPE}" = "inc" ]; then
     fi
 
     # Generate report
-    generate_report
+    # generate_report
 
 # Restore backups
 elif [ "${OPT_BACKUP_TYPE}" = "restore" ]; then
