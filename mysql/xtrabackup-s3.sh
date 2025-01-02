@@ -102,8 +102,10 @@ cleanup_old_backups() {
             if [ "$OPT_DRY_RUN" -eq 1 ]; then
                 echo "Would delete: $FOLDER"
             else
-                echo "Deleting: $FOLDER"
-                mc rm -r --force "$CFG_MC_BUCKET_PATH/$FOLDER"
+                # Remove trailing slash from the folder name
+                FOLDER_CLEANED=$(echo "$FOLDER" | sed 's:/*$::')
+                echo "Deleting: $FOLDER_CLEANED"
+                mc rm -r --force "$CFG_MC_BUCKET_PATH/$FOLDER_CLEANED"
             fi
         else
             DAYS_NEWER=$(( ( $(date -d "$FOLDER_DATE" +%s) - $(date -d "$CUTOFF_DATE" +%s) ) / 86400 ))
