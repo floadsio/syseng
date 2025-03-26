@@ -122,40 +122,97 @@ generate_report() {
 
 # Backup (full or incremental)
 if [ "${OPT_BACKUP_TYPE}" = "full" ] || [ "${OPT_BACKUP_TYPE}" = "inc" ]; then
-    if [ ! -d "${CFG_EXTRA_LSN_DIR}" ]; then
-        echo "Creating local LSN directory: ${CFG_EXTRA_LSN_DIR}"
-        mkdir -p "${CFG_EXTRA_LSN_DIR}"
-    fi
-
     if [ "${OPT_BACKUP_TYPE}" = "inc" ]; then
+        if [ ! -d "${CFG_EXTRA_LSN_DIR}" ]; then
+            echo "Creating local LSN directory: ${CFG_EXTRA_LSN_DIR}"
+            mkdir -p "${CFG_EXTRA_LSN_DIR}"
+        fi
+
         if [ ! -f "${CFG_EXTRA_LSN_DIR}/xtrabackup_checkpoints" ]; then
             echo "No previous full backup found. Please run a full backup first."
             exit 1
         fi
         CFG_INCREMENTAL="--incremental-basedir=${CFG_EXTRA_LSN_DIR}"
-    fi
 
-    if [ "$OPT_DRY_RUN" -eq 1 ]; then
-        echo "Dry run: xtrabackup --backup ${CFG_INCREMENTAL} --extra-lsndir=${CFG_EXTRA_LSN_DIR} --stream=xbstream --target-dir=${CFG_EXTRA_LSN_DIR} | \
+        if [ "$OPT_DRY_RUN" -eq 1 ]; then
+            echo "Dry run: xtrabackup --backup ${CFG_INCREMENTAL} --extra-lsndir=${CFG_EXTRA_LSN_DIR} --stream=xbstream --target-dir=${CFG_EXTRA_LSN_DIR} | \
     xbcloud put ${CFG_BUCKET_PATH}/${CFG_DATE}_${OPT_BACKUP_TYPE}_${CFG_TIMESTAMP}"
-    else
-        xtrabackup --backup ${CFG_INCREMENTAL} --extra-lsndir=${CFG_EXTRA_LSN_DIR} --stream=xbstream --target-dir=${CFG_EXTRA_LSN_DIR} | \
-    xbcloud put ${CFG_BUCKET_PATH}/${CFG_DATE}_${OPT_BACKUP_TYPE}_${CFG_TIMESTAMP}
+        else
+            xtrabackup --backup ${CFG_INCREMENTAL} --extra-lsndir="${CFG_EXTRA_LSN_DIR}" --stream=xbstream --target-dir="${CFG_EXTRA_LSN_DIR}" | \
+        xbcloud put "${CFG_BUCKET_PATH}/${CFG_DATE}_${OPT_BACKUP_TYPE}_${CFG_TIMESTAMP}"
 
-        if [ $? -ne 0 ]; then
-            echo "Backup failed!"
-            exit 1
+            if [ $? -ne 0 ]; then
+                echo "Incremental backup failed!"
+                exit 1
+            fi
+
+            echo "$(date '+%Y-%m-%d %H:%M:%S:%s'): Incremental backup completed successfully"
         fi
+    else
+        # Full backup logic (adapted)
+        if [ -n "$CFG_LOCAL_BACKUP_DIR" ]; then
+            LOCAL_BACKUP_SUBDIR="${CFG_LOCAL_BACKUP_DIR}/${CFG_DATE}_${OPT_BACKUP_TYPE}_${CFG_TIMESTAMP}"
+            echo "Starting full backup to local directory: $LOCAL_BACKUP_SUBDIR"
 
-        echo "$(date '+%Y-%m-%d %H:%M:%S:%s'): Backup completed successfully"
+            if [ "$OPT_DRY_RUN" -eq 1 ]; then
+                echo "Dry run: Would run xtrabackup --backup --extra-lsndir=$LOCAL_BACKUP_SUBDIR --target-dir=$LOCAL_BACKUP_SUBDIR"
+                echo "Dry run: Would sync $LOCAL_BACKUP_SUBDIR to $CFG_MC_BUCKET_PATH/"
+                echo "Dry run: Would prune old backups in $CFG_LOCAL_BACKUP_DIR"
+            else
+                mkdir -p "$LOCAL_BACKUP_SUBDIR"
+
+                KEEP_COUNT="${CFG_LOCAL_BACKUP_KEEP_COUNT:-4}"
+                echo "Pruning old local backups in $CFG_LOCAL_BACKUP_DIR (keeping latest $KEEP_COUNT)..."
+                find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "20*" | sort | head -n -"$KEEP_COUNT" | while read -r OLD; do
+                    echo "Removing old backup: $OLD"
+                    rm -rf "$OLD"
+                done
+
+                xtrabackup --backup \
+                    --extra-lsndir="$LOCAL_BACKUP_SUBDIR" \
+                    --target-dir="$LOCAL_BACKUP_SUBDIR"
+
+                if [ $? -ne 0 ]; then
+                    echo "Full backup failed!"
+                    exit 1
+                fi
+
+                echo "$(date '+%Y-%m-%d %H:%M:%S:%s'): Local full backup completed successfully"
+
+                echo "Syncing local backup to S3..."
+                mc mirror --retry --overwrite "$LOCAL_BACKUP_SUBDIR" "$CFG_MC_BUCKET_PATH/$(basename "$LOCAL_BACKUP_SUBDIR")"
+            fi
+        else
+            echo "CFG_LOCAL_BACKUP_DIR not set. Streaming full backup directly to S3."
+
+            if [ ! -d "${CFG_EXTRA_LSN_DIR}" ]; then
+                echo "Creating local LSN directory: ${CFG_EXTRA_LSN_DIR}"
+                mkdir -p "${CFG_EXTRA_LSN_DIR}"
+            fi
+
+            if [ "$OPT_DRY_RUN" -eq 1 ]; then
+                echo "Dry run: xtrabackup --backup --extra-lsndir=${CFG_EXTRA_LSN_DIR} --stream=xbstream --target-dir=${CFG_EXTRA_LSN_DIR} | \
+    xbcloud put ${CFG_BUCKET_PATH}/${CFG_DATE}_${OPT_BACKUP_TYPE}_${CFG_TIMESTAMP}"
+            else
+                xtrabackup --backup --extra-lsndir="${CFG_EXTRA_LSN_DIR}" --stream=xbstream --target-dir="${CFG_EXTRA_LSN_DIR}" | \
+            xbcloud put "${CFG_BUCKET_PATH}/${CFG_DATE}_${OPT_BACKUP_TYPE}_${CFG_TIMESTAMP}"
+
+                if [ $? -ne 0 ]; then
+                    echo "Full backup failed!"
+                    exit 1
+                fi
+
+                echo "$(date '+%Y-%m-%d %H:%M:%S:%s'): Full backup completed and streamed to S3 successfully"
+            fi
+        fi
     fi
 
-    # Cleanup old backups if the --cleanup option is provided
+    # Cleanup old backups in S3 if requested
     if [ "$OPT_CLEANUP" -eq 1 ]; then
         cleanup_old_backups
     fi
 
-    # Generate report
+    # Generate report (disabled by default)
     # generate_report
 
 # Restore backups
