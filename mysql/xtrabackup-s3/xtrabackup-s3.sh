@@ -273,109 +273,6 @@ elif [ "$OPT_BACKUP_TYPE" = "restore" ]; then
 
     echo "✅ Full backup restored successfully from: $FULL_BACKUP"
 
-elif [ "$OPT_BACKUP_TYPE" = "delete-chain" ]; then
-    FULL_BACKUP=$(echo $BACKUP_ARGUMENTS | awk '{print $1}')
-    [ -z "$FULL_BACKUP" ] && { echo "ERROR: No full backup specified for chain deletion."; exit 1; }
-
-    # Extract timestamp from full backup name
-    FULL_TIMESTAMP=$(echo "$FULL_BACKUP" | grep -o '[0-9]*$')
-    [ -z "$FULL_TIMESTAMP" ] && { echo "ERROR: Could not extract timestamp from backup name: $FULL_BACKUP"; exit 1; }
-
-    if [ "$OPT_DRY_RUN" -eq 1 ]; then
-        echo "# Dry run: showing what would be deleted"
-        echo "Full backup: $FULL_BACKUP"
-        echo ""
-        echo "LOCAL INCREMENTALS TO DELETE:"
-        find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "*_inc_base-${FULL_TIMESTAMP}_*" 2>/dev/null | sort | while read -r inc_backup; do
-            if [ -d "$inc_backup" ]; then
-                inc_name=$(basename "$inc_backup")
-                size=$(du -sh "$inc_backup" 2>/dev/null | cut -f1)
-                echo "  Would delete: $inc_name ($size)"
-            fi
-        done
-        
-        echo ""
-        echo "REMOTE INCREMENTALS TO DELETE:"
-        mc ls "$CFG_MC_BUCKET_PATH" 2>/dev/null | awk '{print $NF}' | grep "_inc_base-${FULL_TIMESTAMP}_" | sort | while read -r inc_folder; do
-            inc_folder=$(echo "$inc_folder" | xargs | sed 's/\/$//')
-            if [ -n "$inc_folder" ]; then
-                size=$(mc du "$CFG_MC_BUCKET_PATH/$inc_folder" 2>/dev/null | awk '{print $1}' || echo "unknown")
-                echo "  Would delete: $inc_folder ($size)"
-            fi
-        done
-        
-        echo ""
-        echo "NOTE: The full backup itself will NOT be deleted"
-        exit 0
-    fi
-
-    # Delete local incrementals
-    echo "Deleting local incremental backups for full backup: $FULL_BACKUP"
-    find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "*_inc_base-${FULL_TIMESTAMP}_*" 2>/dev/null | while read -r inc_backup; do
-        if [ -d "$inc_backup" ]; then
-            inc_name=$(basename "$inc_backup")
-            echo "Deleting local: $inc_name"
-            rm -rf "$inc_backup"
-        fi
-    done
-
-    # Delete remote incrementals
-    echo "Deleting remote incremental backups for full backup: $FULL_BACKUP"
-    mc ls "$CFG_MC_BUCKET_PATH" 2>/dev/null | awk '{print $NF}' | grep "_inc_base-${FULL_TIMESTAMP}_" | while read -r inc_folder; do
-        inc_folder=$(echo "$inc_folder" | xargs | sed 's/\/$//')
-        if [ -n "$inc_folder" ]; then
-            echo "Deleting remote: $inc_folder"
-            mc rb --force "$CFG_MC_BUCKET_PATH/$inc_folder"
-        fi
-    done
-
-    echo "✅ Incremental backup chain deletion completed for: $FULL_BACKUP"
-
-elif [ "$OPT_BACKUP_TYPE" = "sync" ]; then
-    BACKUP_FOLDER=$(echo $BACKUP_ARGUMENTS | awk '{print $1}')
-    [ -z "$BACKUP_FOLDER" ] && { echo "ERROR: No backup folder specified for sync."; exit 1; }
-
-    # Check if it's a full path or just folder name
-    if [ -d "$BACKUP_FOLDER" ]; then
-        LOCAL_BACKUP_PATH="$BACKUP_FOLDER"
-    elif [ -d "$CFG_LOCAL_BACKUP_DIR/$BACKUP_FOLDER" ]; then
-        LOCAL_BACKUP_PATH="$CFG_LOCAL_BACKUP_DIR/$BACKUP_FOLDER"
-    else
-        echo "ERROR: Backup folder not found: $BACKUP_FOLDER"
-        echo "Checked paths:"
-        echo "  - $BACKUP_FOLDER"
-        echo "  - $CFG_LOCAL_BACKUP_DIR/$BACKUP_FOLDER"
-        exit 1
-    fi
-
-    BACKUP_NAME=$(basename "$LOCAL_BACKUP_PATH")
-    
-    if [ "$OPT_DRY_RUN" -eq 1 ]; then
-        echo "# Dry run: showing what would be synced"
-        echo "Local backup: $LOCAL_BACKUP_PATH"
-        echo "Would sync to: $CFG_MC_BUCKET_PATH/$BACKUP_NAME"
-        echo "Command: mc mirror --retry --overwrite \"$LOCAL_BACKUP_PATH\" \"$CFG_MC_BUCKET_PATH/$BACKUP_NAME\""
-        exit 0
-    fi
-
-    echo "Syncing backup to S3..."
-    echo "Local: $LOCAL_BACKUP_PATH"
-    echo "Remote: $CFG_MC_BUCKET_PATH/$BACKUP_NAME"
-    
-    if [ ! -d "$LOCAL_BACKUP_PATH" ]; then
-        echo "ERROR: Local backup directory does not exist: $LOCAL_BACKUP_PATH"
-        exit 1
-    fi
-
-    mc mirror --retry --overwrite "$LOCAL_BACKUP_PATH" "$CFG_MC_BUCKET_PATH/$BACKUP_NAME"
-    
-    if [ $? -eq 0 ]; then
-        echo "✅ Backup synced successfully to S3: $BACKUP_NAME"
-    else
-        echo "❌ Sync failed!"
-        exit 1
-    fi
-
 elif [ "$OPT_BACKUP_TYPE" = "restore-chain" ]; then
     BACKUP_TARGET=$(echo $BACKUP_ARGUMENTS | awk '{print $1}')
     [ -z "$BACKUP_TARGET" ] && { echo "ERROR: No backup specified for chain restore."; exit 1; }
@@ -383,211 +280,12 @@ elif [ "$OPT_BACKUP_TYPE" = "restore-chain" ]; then
     # Determine if it's a full backup or incremental
     if echo "$BACKUP_TARGET" | grep -q "_full_"; then
         FULL_BACKUP="$BACKUP_TARGET"
-        FULL_TIMESTAMP=$(echo "$FULL_BACKUP" | grep -o '[0-9]*
-    if [ ! -d "$CFG_LOCAL_BACKUP_DIR" ]; then
-        echo "ERROR: Local backup directory does not exist: $CFG_LOCAL_BACKUP_DIR"
-        exit 1
-    fi
-
-    # Find all backup directories (both full and incremental)
-    BACKUP_DIRS=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "20*" | sort)
-    
-    if [ -z "$BACKUP_DIRS" ]; then
-        echo "No backup directories found in $CFG_LOCAL_BACKUP_DIR"
-        exit 0
-    fi
-
-    if [ "$OPT_DRY_RUN" -eq 1 ]; then
-        echo "# Dry run: showing what would be synced"
-        echo "Local backup directory: $CFG_LOCAL_BACKUP_DIR"
-        echo ""
-        echo "BACKUPS TO SYNC:"
-        echo "$BACKUP_DIRS" | while read -r backup_dir; do
-            if [ -d "$backup_dir" ]; then
-                backup_name=$(basename "$backup_dir")
-                size=$(du -sh "$backup_dir" 2>/dev/null | cut -f1)
-                echo "  Would sync: $backup_name ($size) -> $CFG_MC_BUCKET_PATH/$backup_name"
-            fi
-        done
-        exit 0
-    fi
-
-    echo "Syncing all local backups to S3..."
-    echo "Local backup directory: $CFG_LOCAL_BACKUP_DIR"
-    echo ""
-
-    SUCCESS_COUNT=0
-    FAILURE_COUNT=0
-
-    echo "$BACKUP_DIRS" | while read -r backup_dir; do
-        if [ -d "$backup_dir" ]; then
-            backup_name=$(basename "$backup_dir")
-            echo "🔄 Syncing: $backup_name"
-            
-            mc mirror --retry --overwrite "$backup_dir" "$CFG_MC_BUCKET_PATH/$backup_name"
-            
-            if [ $? -eq 0 ]; then
-                echo "✅ Synced: $backup_name"
-                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-            else
-                echo "❌ Failed: $backup_name"
-                FAILURE_COUNT=$((FAILURE_COUNT + 1))
-            fi
-            echo ""
-        fi
-    done
-
-    echo "=== SYNC SUMMARY ==="
-    echo "Successful: $SUCCESS_COUNT"
-    echo "Failed: $FAILURE_COUNT"
-    
-    if [ "$FAILURE_COUNT" -gt 0 ]; then
-        echo "Some backups failed to sync. Check the output above for details."
-        exit 1
-    else
-        echo "✅ All backups synced successfully!"
-    fi
-
-elif [ "$OPT_BACKUP_TYPE" = "list" ]; then
-    list_backups
-
-else
-    echo "MySQL XtraBackup S3 Management Script"
-    echo ""
-    echo "Usage: $0 {full|inc|list|delete-chain|sync|sync-all} [OPTIONS]"
-    echo ""
-    echo "COMMANDS:"
-    echo "  full                    Create full backup"
-    echo "  inc                     Create incremental backup"  
-    echo "  list                    List all backups (local and S3)"
-    echo "  restore <backup>        Restore from full backup only"
-    echo "  restore-chain <backup>  Restore full backup + incrementals"
-    echo "  delete-chain <backup>   Delete all incrementals for a full backup"
-    echo "  sync <backup-folder>    Sync specific backup to S3"
-    echo "  sync-all               Sync all local backups to S3"
-    echo ""
-    echo "OPTIONS:"
-    echo "  --dry-run              Show what would be done without executing"
-    echo "  --cleanup              Remove old backups (for full/inc commands)"
-    echo "  --no-sync              Skip S3 sync, local backup only"
-    echo ""
-    echo "EXAMPLES:"
-    echo "  $0 full --cleanup                                    # Full backup with cleanup"
-    echo "  $0 inc --no-sync                                     # Incremental backup, no S3 sync"
-    echo "  $0 list                                              # Show backup chains"
-    echo "  $0 restore 2025-06-26_08-57-49_full_1750928269      # Restore full backup only"
-    echo "  $0 restore-chain 2025-06-26_08-57-49_full_1750928269 # Restore full + all incrementals"
-    echo "  $0 restore-chain 2025-06-26_13-11-05_inc_base-*     # Restore up to specific incremental"
-    echo "  $0 sync 2025-06-26_13-11-05_inc_base-1750928269_*   # Sync specific backup"
-    echo "  $0 sync-all --dry-run                               # Preview sync all"
-    echo "  $0 delete-chain 2025-06-26_08-57-49_full_* --dry-run # Preview delete incrementals"
-    exit 1
-fi
-
-exit 0)
+        FULL_TIMESTAMP=$(echo "$FULL_BACKUP" | grep -o '[0-9]*$')
         RESTORE_MODE="full_with_incrementals"
     elif echo "$BACKUP_TARGET" | grep -q "_inc_base-"; then
         # Extract the base timestamp from incremental name
         FULL_TIMESTAMP=$(echo "$BACKUP_TARGET" | sed 's/.*_inc_base-\([0-9]*\)_.*/\1/')
-        TARGET_TIMESTAMP=$(echo "$BACKUP_TARGET" | grep -o '[0-9]*
-    if [ ! -d "$CFG_LOCAL_BACKUP_DIR" ]; then
-        echo "ERROR: Local backup directory does not exist: $CFG_LOCAL_BACKUP_DIR"
-        exit 1
-    fi
-
-    # Find all backup directories (both full and incremental)
-    BACKUP_DIRS=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "20*" | sort)
-    
-    if [ -z "$BACKUP_DIRS" ]; then
-        echo "No backup directories found in $CFG_LOCAL_BACKUP_DIR"
-        exit 0
-    fi
-
-    if [ "$OPT_DRY_RUN" -eq 1 ]; then
-        echo "# Dry run: showing what would be synced"
-        echo "Local backup directory: $CFG_LOCAL_BACKUP_DIR"
-        echo ""
-        echo "BACKUPS TO SYNC:"
-        echo "$BACKUP_DIRS" | while read -r backup_dir; do
-            if [ -d "$backup_dir" ]; then
-                backup_name=$(basename "$backup_dir")
-                size=$(du -sh "$backup_dir" 2>/dev/null | cut -f1)
-                echo "  Would sync: $backup_name ($size) -> $CFG_MC_BUCKET_PATH/$backup_name"
-            fi
-        done
-        exit 0
-    fi
-
-    echo "Syncing all local backups to S3..."
-    echo "Local backup directory: $CFG_LOCAL_BACKUP_DIR"
-    echo ""
-
-    SUCCESS_COUNT=0
-    FAILURE_COUNT=0
-
-    echo "$BACKUP_DIRS" | while read -r backup_dir; do
-        if [ -d "$backup_dir" ]; then
-            backup_name=$(basename "$backup_dir")
-            echo "🔄 Syncing: $backup_name"
-            
-            mc mirror --retry --overwrite "$backup_dir" "$CFG_MC_BUCKET_PATH/$backup_name"
-            
-            if [ $? -eq 0 ]; then
-                echo "✅ Synced: $backup_name"
-                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-            else
-                echo "❌ Failed: $backup_name"
-                FAILURE_COUNT=$((FAILURE_COUNT + 1))
-            fi
-            echo ""
-        fi
-    done
-
-    echo "=== SYNC SUMMARY ==="
-    echo "Successful: $SUCCESS_COUNT"
-    echo "Failed: $FAILURE_COUNT"
-    
-    if [ "$FAILURE_COUNT" -gt 0 ]; then
-        echo "Some backups failed to sync. Check the output above for details."
-        exit 1
-    else
-        echo "✅ All backups synced successfully!"
-    fi
-
-elif [ "$OPT_BACKUP_TYPE" = "list" ]; then
-    list_backups
-
-else
-    echo "MySQL XtraBackup S3 Management Script"
-    echo ""
-    echo "Usage: $0 {full|inc|list|delete-chain|sync|sync-all} [OPTIONS]"
-    echo ""
-    echo "COMMANDS:"
-    echo "  full                    Create full backup"
-    echo "  inc                     Create incremental backup"  
-    echo "  list                    List all backups (local and S3)"
-    echo "  restore <backup>        Restore from backup"
-    echo "  delete-chain <backup>   Delete all incrementals for a full backup"
-    echo "  sync <backup-folder>    Sync specific backup to S3"
-    echo "  sync-all               Sync all local backups to S3"
-    echo ""
-    echo "OPTIONS:"
-    echo "  --dry-run              Show what would be done without executing"
-    echo "  --cleanup              Remove old backups (for full/inc commands)"
-    echo "  --no-sync              Skip S3 sync, local backup only"
-    echo ""
-    echo "EXAMPLES:"
-    echo "  $0 full --cleanup                                    # Full backup with cleanup"
-    echo "  $0 inc --no-sync                                     # Incremental backup, no S3 sync"
-    echo "  $0 list                                              # Show backup chains"
-    echo "  $0 restore 2025-06-26_08-57-49_full_1750928269      # Restore from full backup"
-    echo "  $0 sync 2025-06-26_13-11-05_inc_base-1750928269_*   # Sync specific backup"
-    echo "  $0 sync-all --dry-run                               # Preview sync all"
-    echo "  $0 delete-chain 2025-06-26_08-57-49_full_* --dry-run # Preview delete incrementals"
-    exit 1
-fi
-
-exit 0)
+        TARGET_TIMESTAMP=$(echo "$BACKUP_TARGET" | grep -o '[0-9]*$')
         RESTORE_MODE="up_to_incremental"
         
         # Find the full backup name
@@ -735,6 +433,109 @@ exit 0)
         echo "Restored full backup with all incrementals: $FULL_BACKUP"
     fi
 
+elif [ "$OPT_BACKUP_TYPE" = "delete-chain" ]; then
+    FULL_BACKUP=$(echo $BACKUP_ARGUMENTS | awk '{print $1}')
+    [ -z "$FULL_BACKUP" ] && { echo "ERROR: No full backup specified for chain deletion."; exit 1; }
+
+    # Extract timestamp from full backup name
+    FULL_TIMESTAMP=$(echo "$FULL_BACKUP" | grep -o '[0-9]*$')
+    [ -z "$FULL_TIMESTAMP" ] && { echo "ERROR: Could not extract timestamp from backup name: $FULL_BACKUP"; exit 1; }
+
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        echo "# Dry run: showing what would be deleted"
+        echo "Full backup: $FULL_BACKUP"
+        echo ""
+        echo "LOCAL INCREMENTALS TO DELETE:"
+        find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "*_inc_base-${FULL_TIMESTAMP}_*" 2>/dev/null | sort | while read -r inc_backup; do
+            if [ -d "$inc_backup" ]; then
+                inc_name=$(basename "$inc_backup")
+                size=$(du -sh "$inc_backup" 2>/dev/null | cut -f1)
+                echo "  Would delete: $inc_name ($size)"
+            fi
+        done
+        
+        echo ""
+        echo "REMOTE INCREMENTALS TO DELETE:"
+        mc ls "$CFG_MC_BUCKET_PATH" 2>/dev/null | awk '{print $NF}' | grep "_inc_base-${FULL_TIMESTAMP}_" | sort | while read -r inc_folder; do
+            inc_folder=$(echo "$inc_folder" | xargs | sed 's/\/$//')
+            if [ -n "$inc_folder" ]; then
+                size=$(mc du "$CFG_MC_BUCKET_PATH/$inc_folder" 2>/dev/null | awk '{print $1}' || echo "unknown")
+                echo "  Would delete: $inc_folder ($size)"
+            fi
+        done
+        
+        echo ""
+        echo "NOTE: The full backup itself will NOT be deleted"
+        exit 0
+    fi
+
+    # Delete local incrementals
+    echo "Deleting local incremental backups for full backup: $FULL_BACKUP"
+    find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "*_inc_base-${FULL_TIMESTAMP}_*" 2>/dev/null | while read -r inc_backup; do
+        if [ -d "$inc_backup" ]; then
+            inc_name=$(basename "$inc_backup")
+            echo "Deleting local: $inc_name"
+            rm -rf "$inc_backup"
+        fi
+    done
+
+    # Delete remote incrementals
+    echo "Deleting remote incremental backups for full backup: $FULL_BACKUP"
+    mc ls "$CFG_MC_BUCKET_PATH" 2>/dev/null | awk '{print $NF}' | grep "_inc_base-${FULL_TIMESTAMP}_" | while read -r inc_folder; do
+        inc_folder=$(echo "$inc_folder" | xargs | sed 's/\/$//')
+        if [ -n "$inc_folder" ]; then
+            echo "Deleting remote: $inc_folder"
+            mc rb --force "$CFG_MC_BUCKET_PATH/$inc_folder"
+        fi
+    done
+
+    echo "✅ Incremental backup chain deletion completed for: $FULL_BACKUP"
+
+elif [ "$OPT_BACKUP_TYPE" = "sync" ]; then
+    BACKUP_FOLDER=$(echo $BACKUP_ARGUMENTS | awk '{print $1}')
+    [ -z "$BACKUP_FOLDER" ] && { echo "ERROR: No backup folder specified for sync."; exit 1; }
+
+    # Check if it's a full path or just folder name
+    if [ -d "$BACKUP_FOLDER" ]; then
+        LOCAL_BACKUP_PATH="$BACKUP_FOLDER"
+    elif [ -d "$CFG_LOCAL_BACKUP_DIR/$BACKUP_FOLDER" ]; then
+        LOCAL_BACKUP_PATH="$CFG_LOCAL_BACKUP_DIR/$BACKUP_FOLDER"
+    else
+        echo "ERROR: Backup folder not found: $BACKUP_FOLDER"
+        echo "Checked paths:"
+        echo "  - $BACKUP_FOLDER"
+        echo "  - $CFG_LOCAL_BACKUP_DIR/$BACKUP_FOLDER"
+        exit 1
+    fi
+
+    BACKUP_NAME=$(basename "$LOCAL_BACKUP_PATH")
+    
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        echo "# Dry run: showing what would be synced"
+        echo "Local backup: $LOCAL_BACKUP_PATH"
+        echo "Would sync to: $CFG_MC_BUCKET_PATH/$BACKUP_NAME"
+        echo "Command: mc mirror --retry --overwrite \"$LOCAL_BACKUP_PATH\" \"$CFG_MC_BUCKET_PATH/$BACKUP_NAME\""
+        exit 0
+    fi
+
+    echo "Syncing backup to S3..."
+    echo "Local: $LOCAL_BACKUP_PATH"
+    echo "Remote: $CFG_MC_BUCKET_PATH/$BACKUP_NAME"
+    
+    if [ ! -d "$LOCAL_BACKUP_PATH" ]; then
+        echo "ERROR: Local backup directory does not exist: $LOCAL_BACKUP_PATH"
+        exit 1
+    fi
+
+    mc mirror --retry --overwrite "$LOCAL_BACKUP_PATH" "$CFG_MC_BUCKET_PATH/$BACKUP_NAME"
+    
+    if [ $? -eq 0 ]; then
+        echo "✅ Backup synced successfully to S3: $BACKUP_NAME"
+    else
+        echo "❌ Sync failed!"
+        exit 1
+    fi
+
 elif [ "$OPT_BACKUP_TYPE" = "sync-all" ]; then
     if [ ! -d "$CFG_LOCAL_BACKUP_DIR" ]; then
         echo "ERROR: Local backup directory does not exist: $CFG_LOCAL_BACKUP_DIR"
@@ -806,13 +607,14 @@ elif [ "$OPT_BACKUP_TYPE" = "list" ]; then
 else
     echo "MySQL XtraBackup S3 Management Script"
     echo ""
-    echo "Usage: $0 {full|inc|list|delete-chain|sync|sync-all} [OPTIONS]"
+    echo "Usage: $0 {full|inc|list|delete-chain|sync|sync-all|restore-chain} [OPTIONS]"
     echo ""
     echo "COMMANDS:"
     echo "  full                    Create full backup"
     echo "  inc                     Create incremental backup"  
     echo "  list                    List all backups (local and S3)"
-    echo "  restore <backup>        Restore from backup"
+    echo "  restore <backup>        Restore from full backup only"
+    echo "  restore-chain <backup>  Restore full backup + incrementals"
     echo "  delete-chain <backup>   Delete all incrementals for a full backup"
     echo "  sync <backup-folder>    Sync specific backup to S3"
     echo "  sync-all               Sync all local backups to S3"
@@ -826,7 +628,9 @@ else
     echo "  $0 full --cleanup                                    # Full backup with cleanup"
     echo "  $0 inc --no-sync                                     # Incremental backup, no S3 sync"
     echo "  $0 list                                              # Show backup chains"
-    echo "  $0 restore 2025-06-26_08-57-49_full_1750928269      # Restore from full backup"
+    echo "  $0 restore 2025-06-26_08-57-49_full_1750928269      # Restore full backup only"
+    echo "  $0 restore-chain 2025-06-26_08-57-49_full_1750928269 # Restore full + all incrementals"
+    echo "  $0 restore-chain 2025-06-26_13-11-05_inc_base-*     # Restore up to specific incremental"
     echo "  $0 sync 2025-06-26_13-11-05_inc_base-1750928269_*   # Sync specific backup"
     echo "  $0 sync-all --dry-run                               # Preview sync all"
     echo "  $0 delete-chain 2025-06-26_08-57-49_full_* --dry-run # Preview delete incrementals"
