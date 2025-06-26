@@ -4,6 +4,7 @@
 #   xtrabackup-s3.sh full [--dry-run] [--cleanup]
 #   xtrabackup-s3.sh inc [--dry-run] [--cleanup]
 #   xtrabackup-s3.sh restore <full-backup> [--dry-run]
+#   xtrabackup-s3.sh list
 
 CFG_EXTRA_LSN_DIR="/var/backups/mysql_lsn"
 CFG_HOSTNAME=$(hostname)
@@ -69,6 +70,32 @@ cleanup_old_backups() {
 generate_report() {
     echo "Backup report:"
     mc du "$CFG_MC_BUCKET_PATH" | awk '{print "Total Size: " $1 "\nTotal Objects: " $2 "\nPath: " $3}'
+}
+
+list_backups() {
+    echo "=== LOCAL BACKUPS ==="
+    if [ -n "$CFG_LOCAL_BACKUP_DIR" ] && [ -d "$CFG_LOCAL_BACKUP_DIR" ]; then
+        find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "20*" | sort -r | while read -r backup; do
+            backup_name=$(basename "$backup")
+            size=$(du -sh "$backup" 2>/dev/null | cut -f1)
+            echo "  $backup_name ($size)"
+        done
+    else
+        echo "  No local backup directory configured or found"
+    fi
+    
+    echo ""
+    echo "=== REMOTE BACKUPS (S3) ==="
+    if mc ls "$CFG_MC_BUCKET_PATH" >/dev/null 2>&1; then
+        mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | sort -r | while read -r folder; do
+            folder=$(echo "$folder" | xargs)
+            # get rough size if possible
+            size=$(mc du "$CFG_MC_BUCKET_PATH/$folder" 2>/dev/null | awk '{print $1}' || echo "unknown")
+            echo "  $folder ($size)"
+        done
+    else
+        echo "  Could not access remote backups (check mc config)"
+    fi
 }
 
 if [ "$OPT_BACKUP_TYPE" = "full" ] || [ "$OPT_BACKUP_TYPE" = "inc" ]; then
@@ -168,8 +195,12 @@ elif [ "$OPT_BACKUP_TYPE" = "restore" ]; then
     systemctl start mysql
 
     echo "✅ Full backup restored successfully from: $FULL_BACKUP"
+
+elif [ "$OPT_BACKUP_TYPE" = "list" ]; then
+    list_backups
+
 else
-    echo "Usage: $0 {full|inc} [--dry-run] [--cleanup]"
+    echo "Usage: $0 {full|inc|list} [--dry-run] [--cleanup]"
     echo "       $0 restore <full-backup> [--dry-run]"
     exit 1
 fi
