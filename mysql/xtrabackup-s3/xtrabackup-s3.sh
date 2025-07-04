@@ -84,7 +84,6 @@ generate_report() {
 list_backups() {
     echo "=== LOCAL BACKUPS ==="
     if [ -n "$CFG_LOCAL_BACKUP_DIR" ] && [ -d "$CFG_LOCAL_BACKUP_DIR" ]; then
-        # Group backups by full backup chains
         find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "*_full_*" | sort -r | while read -r full_backup; do
             if [ -d "$full_backup" ]; then
                 backup_name=$(basename "$full_backup")
@@ -92,7 +91,6 @@ list_backups() {
                 timestamp=$(echo "$backup_name" | grep -o '[0-9]*$')
                 echo "📁 $backup_name ($size) [FULL]"
                 
-                # Find incrementals for this full backup
                 find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "*_inc_base-${timestamp}_*" | sort | while read -r inc_backup; do
                     if [ -d "$inc_backup" ]; then
                         inc_name=$(basename "$inc_backup")
@@ -109,7 +107,6 @@ list_backups() {
     echo ""
     echo "=== REMOTE BACKUPS (S3) ==="
     if mc ls "$CFG_MC_BUCKET_PATH" >/dev/null 2>&1; then
-        # Group remote backups by full backup chains
         mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | grep "_full_" | sort -r | while read -r full_folder; do
             full_folder=$(echo "$full_folder" | xargs | sed 's/\/$//')
             if [ -n "$full_folder" ]; then
@@ -117,7 +114,6 @@ list_backups() {
                 timestamp=$(echo "$full_folder" | grep -o '[0-9]*$')
                 echo "📁 $full_folder ($size) [FULL]"
                 
-                # Find incrementals for this full backup
                 mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | grep "_inc_base-${timestamp}_" | sort | while read -r inc_folder; do
                     inc_folder=$(echo "$inc_folder" | xargs | sed 's/\/$//')
                     if [ -n "$inc_folder" ]; then
@@ -133,27 +129,32 @@ list_backups() {
 }
 
 if [ "$OPT_BACKUP_TYPE" = "full" ] || [ "$OPT_BACKUP_TYPE" = "inc" ]; then
-    # All backups now require local backup directory
     if [ -z "$CFG_LOCAL_BACKUP_DIR" ]; then
         echo "ERROR: CFG_LOCAL_BACKUP_DIR must be configured for all backup operations."
         exit 1
     fi
 
     if [ "$OPT_BACKUP_TYPE" = "inc" ]; then
-        # Find the most recent full backup to use as base
-        LATEST_FULL=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "*_full_*" | sort -r | head -n 1)
-        if [ -z "$LATEST_FULL" ]; then
-            echo "No previous full backup found in $CFG_LOCAL_BACKUP_DIR. Please run a full backup first."
+        LATEST_BACKUP=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "20*" | sort -r | head -n 1)
+        if [ -z "$LATEST_BACKUP" ]; then
+            echo "No previous backup found in $CFG_LOCAL_BACKUP_DIR. Please run a full backup first."
             exit 1
         fi
 
-        CFG_INCREMENTAL="--incremental-basedir=$LATEST_FULL"
-        BASE_TIMESTAMP=$(basename "$LATEST_FULL" | grep -o '[0-9]*$')
+        LATEST_BACKUP_NAME=$(basename "$LATEST_BACKUP")
+        if echo "$LATEST_BACKUP_NAME" | grep -q "_full_"; then
+            BASE_TIMESTAMP=$(echo "$LATEST_BACKUP_NAME" | grep -o '[0-9]*$')
+        else
+            BASE_TIMESTAMP=$(echo "$LATEST_BACKUP_NAME" | sed 's/.*_inc_base-\([0-9]*\)_.*/\1/')
+        fi
+
+        CFG_INCREMENTAL="--incremental-basedir=$LATEST_BACKUP"
         LOCAL_BACKUP_DIR="${CFG_LOCAL_BACKUP_DIR}/${CFG_DATE}_${OPT_BACKUP_TYPE}_base-${BASE_TIMESTAMP}_${CFG_TIMESTAMP}"
 
         if [ "$OPT_DRY_RUN" -eq 1 ]; then
             echo "Dry run: would run incremental backup"
-            echo "Base backup: $LATEST_FULL"
+            echo "Base backup: $LATEST_BACKUP"
+            echo "Original full backup timestamp: $BASE_TIMESTAMP"
             echo "Would create: $LOCAL_BACKUP_DIR"
             echo "Command: xtrabackup --backup ${CFG_INCREMENTAL} --extra-lsndir=\"$LOCAL_BACKUP_DIR\" --target-dir=\"$LOCAL_BACKUP_DIR\""
             if [ "$OPT_NO_SYNC" -eq 1 ]; then
@@ -178,7 +179,6 @@ if [ "$OPT_BACKUP_TYPE" = "full" ] || [ "$OPT_BACKUP_TYPE" = "inc" ]; then
             fi
         fi
     else
-        # Full backup
         LOCAL_BACKUP_DIR="${CFG_LOCAL_BACKUP_DIR}/${CFG_DATE}_${OPT_BACKUP_TYPE}_${CFG_TIMESTAMP}"
 
         if [ "$OPT_DRY_RUN" -eq 1 ]; then
@@ -194,7 +194,6 @@ if [ "$OPT_BACKUP_TYPE" = "full" ] || [ "$OPT_BACKUP_TYPE" = "inc" ]; then
         else
             mkdir -p "$LOCAL_BACKUP_DIR"
             
-            # Cleanup old local backups
             KEEP_COUNT="${CFG_LOCAL_BACKUP_KEEP_COUNT:-4}"
             find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "20*" | sort | head -n -"$KEEP_COUNT" | while read -r OLD; do
                 rm -rf "$OLD"
@@ -277,18 +276,15 @@ elif [ "$OPT_BACKUP_TYPE" = "restore-chain" ]; then
     BACKUP_TARGET=$(echo $BACKUP_ARGUMENTS | awk '{print $1}')
     [ -z "$BACKUP_TARGET" ] && { echo "ERROR: No backup specified for chain restore."; exit 1; }
 
-    # Determine if it's a full backup or incremental
     if echo "$BACKUP_TARGET" | grep -q "_full_"; then
         FULL_BACKUP="$BACKUP_TARGET"
         FULL_TIMESTAMP=$(echo "$FULL_BACKUP" | grep -o '[0-9]*$')
         RESTORE_MODE="full_with_incrementals"
     elif echo "$BACKUP_TARGET" | grep -q "_inc_base-"; then
-        # Extract the base timestamp from incremental name
         FULL_TIMESTAMP=$(echo "$BACKUP_TARGET" | sed 's/.*_inc_base-\([0-9]*\)_.*/\1/')
         TARGET_TIMESTAMP=$(echo "$BACKUP_TARGET" | grep -o '[0-9]*$')
         RESTORE_MODE="up_to_incremental"
         
-        # Find the full backup name
         FULL_BACKUP=$(mc ls "$CFG_MC_BUCKET_PATH" 2>/dev/null | awk '{print $NF}' | grep "_full_${FULL_TIMESTAMP}" | head -n 1 | sed 's/\/$//')
         [ -z "$FULL_BACKUP" ] && { echo "ERROR: Could not find full backup for timestamp: $FULL_TIMESTAMP"; exit 1; }
     else
@@ -296,11 +292,9 @@ elif [ "$OPT_BACKUP_TYPE" = "restore-chain" ]; then
         exit 1
     fi
 
-    # Find all incrementals for this full backup
     if [ "$RESTORE_MODE" = "full_with_incrementals" ]; then
         INCREMENTALS=$(mc ls "$CFG_MC_BUCKET_PATH" 2>/dev/null | awk '{print $NF}' | grep "_inc_base-${FULL_TIMESTAMP}_" | sed 's/\/$//' | sort)
     else
-        # Get incrementals up to and including the target
         INCREMENTALS=$(mc ls "$CFG_MC_BUCKET_PATH" 2>/dev/null | awk '{print $NF}' | grep "_inc_base-${FULL_TIMESTAMP}_" | sed 's/\/$//' | sort | awk -v target="$TARGET_TIMESTAMP" '{
             inc_ts = $0; gsub(/.*_/, "", inc_ts)
             if (inc_ts <= target) print $0
@@ -348,7 +342,6 @@ elif [ "$OPT_BACKUP_TYPE" = "restore-chain" ]; then
         exit 0
     fi
 
-    # Create temporary restore directory
     RESTORE_TMP="/tmp/restore"
     rm -rf "$RESTORE_TMP"
     mkdir -p "$RESTORE_TMP"
@@ -389,7 +382,6 @@ elif [ "$OPT_BACKUP_TYPE" = "restore-chain" ]; then
     echo "Preparing full backup (with --apply-log-only)..."
     xtrabackup --prepare --apply-log-only --target-dir=/var/lib/mysql
 
-    # Process incrementals
     if [ -n "$INCREMENTALS" ]; then
         echo "$INCREMENTALS" | while read -r inc; do
             echo ""
@@ -437,7 +429,6 @@ elif [ "$OPT_BACKUP_TYPE" = "delete-chain" ]; then
     FULL_BACKUP=$(echo $BACKUP_ARGUMENTS | awk '{print $1}')
     [ -z "$FULL_BACKUP" ] && { echo "ERROR: No full backup specified for chain deletion."; exit 1; }
 
-    # Extract timestamp from full backup name
     FULL_TIMESTAMP=$(echo "$FULL_BACKUP" | grep -o '[0-9]*$')
     [ -z "$FULL_TIMESTAMP" ] && { echo "ERROR: Could not extract timestamp from backup name: $FULL_BACKUP"; exit 1; }
 
@@ -469,7 +460,6 @@ elif [ "$OPT_BACKUP_TYPE" = "delete-chain" ]; then
         exit 0
     fi
 
-    # Delete local incrementals
     echo "Deleting local incremental backups for full backup: $FULL_BACKUP"
     find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "*_inc_base-${FULL_TIMESTAMP}_*" 2>/dev/null | while read -r inc_backup; do
         if [ -d "$inc_backup" ]; then
@@ -479,7 +469,6 @@ elif [ "$OPT_BACKUP_TYPE" = "delete-chain" ]; then
         fi
     done
 
-    # Delete remote incrementals
     echo "Deleting remote incremental backups for full backup: $FULL_BACKUP"
     mc ls "$CFG_MC_BUCKET_PATH" 2>/dev/null | awk '{print $NF}' | grep "_inc_base-${FULL_TIMESTAMP}_" | while read -r inc_folder; do
         inc_folder=$(echo "$inc_folder" | xargs | sed 's/\/$//')
@@ -495,7 +484,6 @@ elif [ "$OPT_BACKUP_TYPE" = "sync" ]; then
     BACKUP_FOLDER=$(echo $BACKUP_ARGUMENTS | awk '{print $1}')
     [ -z "$BACKUP_FOLDER" ] && { echo "ERROR: No backup folder specified for sync."; exit 1; }
 
-    # Check if it's a full path or just folder name
     if [ -d "$BACKUP_FOLDER" ]; then
         LOCAL_BACKUP_PATH="$BACKUP_FOLDER"
     elif [ -d "$CFG_LOCAL_BACKUP_DIR/$BACKUP_FOLDER" ]; then
@@ -542,7 +530,6 @@ elif [ "$OPT_BACKUP_TYPE" = "sync-all" ]; then
         exit 1
     fi
 
-    # Find all backup directories (both full and incremental)
     BACKUP_DIRS=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "20*" | sort)
     
     if [ -z "$BACKUP_DIRS" ]; then
