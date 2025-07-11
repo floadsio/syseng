@@ -4,7 +4,7 @@
 #   xtrabackup-s3.sh full [--dry-run] [--cleanup] [--no-sync]
 #   xtrabackup-s3.sh inc [--dry-run] [--cleanup] [--no-sync]
 #   xtrabackup-s3.sh restore <full-backup> [--dry-run]
-#   xtrabackup-s3.sh restore-chain <backup> [--dry-run]
+#   xtrabackup-s3.sh restore-chain <backup> [--dry-run] [--restore-dir=<path>]
 #   xtrabackup-s3.sh list
 #   xtrabackup-s3.sh delete-chain <full-backup> [--dry-run]
 #   xtrabackup-s3.sh sync <backup-folder> [--dry-run]
@@ -37,6 +37,7 @@ OPT_BACKUP_TYPE="${1:-}"
 OPT_DRY_RUN=0
 OPT_CLEANUP=0
 OPT_NO_SYNC=0
+OPT_RESTORE_DIR=""
 
 # Only shift if there are arguments
 if [ $# -gt 0 ]; then
@@ -46,6 +47,7 @@ if [ $# -gt 0 ]; then
             --dry-run) OPT_DRY_RUN=1 ;;
             --cleanup) OPT_CLEANUP=1 ;;
             --no-sync) OPT_NO_SYNC=1 ;;
+            --restore-dir=*) OPT_RESTORE_DIR="${1#*=}" ;;
             *) BACKUP_ARGUMENTS="$BACKUP_ARGUMENTS $1" ;;
         esac
         shift
@@ -313,7 +315,7 @@ elif [ "$OPT_BACKUP_TYPE" = "restore-chain" ]; then
         echo "1. systemctl stop mysql"
         echo "2. rm -rf /var/lib/mysql/* && mkdir -p /var/lib/mysql"
         echo "3. Download and restore full backup: $FULL_BACKUP"
-        echo "4. mc mirror \"${CFG_MC_BUCKET_PATH}/${FULL_BACKUP}\" /tmp/restore/$FULL_BACKUP"
+        echo "4. mc mirror \"${CFG_MC_BUCKET_PATH}/${FULL_BACKUP}\" /var/lib/mysql"
         echo "5. Decrypt and decompress full backup files"
         echo "6. xtrabackup --prepare --apply-log-only --target-dir=/var/lib/mysql"
         
@@ -322,9 +324,9 @@ elif [ "$OPT_BACKUP_TYPE" = "restore-chain" ]; then
             echo "INCREMENTAL SEQUENCE:"
             echo "$INCREMENTALS" | while read -r inc; do
                 echo "7. Download incremental: $inc"
-                echo "8. mc mirror \"${CFG_MC_BUCKET_PATH}/${inc}\" /tmp/restore/$inc"
+                echo "8. mc mirror \"${CFG_MC_BUCKET_PATH}/${inc}\" ${OPT_RESTORE_DIR:-/tmp/restore}/$inc"
                 echo "9. Decrypt and decompress incremental files"
-                echo "10. xtrabackup --prepare --apply-log-only --target-dir=/var/lib/mysql --incremental-dir=/tmp/restore/$inc"
+                echo "10. xtrabackup --prepare --apply-log-only --target-dir=/var/lib/mysql --incremental-dir=${OPT_RESTORE_DIR:-/tmp/restore}/$inc"
             done
             echo ""
             echo "FINAL STEPS:"
@@ -338,11 +340,11 @@ elif [ "$OPT_BACKUP_TYPE" = "restore-chain" ]; then
         echo "12. chown -R mysql:mysql /var/lib/mysql"
         echo "13. systemctl start mysql"
         echo ""
-        echo "Temporary files will be stored in: /tmp/restore/"
+        echo "Temporary files will be stored in: ${OPT_RESTORE_DIR:-/tmp/restore}/"
         exit 0
     fi
 
-    RESTORE_TMP="/tmp/restore"
+    RESTORE_TMP="${OPT_RESTORE_DIR:-/tmp/restore}"
     rm -rf "$RESTORE_TMP"
     mkdir -p "$RESTORE_TMP"
 
@@ -364,10 +366,10 @@ elif [ "$OPT_BACKUP_TYPE" = "restore-chain" ]; then
     chmod 0750 /var/lib/mysql
 
     echo "Downloading and restoring full backup: $FULL_BACKUP"
-    mc mirror --overwrite --remove "${CFG_MC_BUCKET_PATH}/${FULL_BACKUP}" "$RESTORE_TMP/$FULL_BACKUP"
+    mc mirror --overwrite --remove "${CFG_MC_BUCKET_PATH}/${FULL_BACKUP}" /var/lib/mysql
 
     echo "Decrypting and decompressing full backup files..."
-    find "$RESTORE_TMP/$FULL_BACKUP" -name '*.zst.xbcrypt' | while read -r f; do
+    find /var/lib/mysql -name '*.zst.xbcrypt' | while read -r f; do
         out="${f%.zst.xbcrypt}"
         if [ ! -f "$out" ]; then
             echo "🔄 Processing: $(basename "$f")"
@@ -375,9 +377,6 @@ elif [ "$OPT_BACKUP_TYPE" = "restore-chain" ]; then
             zstd -d "$out.zst" -o "$out" && rm -f "$out.zst"
         fi
     done
-
-    echo "Copying full backup to MySQL directory..."
-    cp -r "$RESTORE_TMP/$FULL_BACKUP"/* /var/lib/mysql/
 
     echo "Preparing full backup (with --apply-log-only)..."
     xtrabackup --prepare --apply-log-only --target-dir=/var/lib/mysql
@@ -610,6 +609,7 @@ else
     echo "  --dry-run              Show what would be done without executing"
     echo "  --cleanup              Remove old backups (for full/inc commands)"
     echo "  --no-sync              Skip S3 sync, local backup only"
+    echo "  --restore-dir=<path>   Custom restore directory (default: /tmp/restore)"
     echo ""
     echo "EXAMPLES:"
     echo "  $0 full --cleanup                                    # Full backup with cleanup"
@@ -618,6 +618,7 @@ else
     echo "  $0 restore 2025-06-26_08-57-49_full_1750928269      # Restore full backup only"
     echo "  $0 restore-chain 2025-06-26_08-57-49_full_1750928269 # Restore full + all incrementals"
     echo "  $0 restore-chain 2025-06-26_13-11-05_inc_base-*     # Restore up to specific incremental"
+    echo "  $0 restore-chain 2025-06-26_13-11-05_inc_base-* --restore-dir=/mnt/restore # Custom restore dir"
     echo "  $0 sync 2025-06-26_13-11-05_inc_base-1750928269_*   # Sync specific backup"
     echo "  $0 sync-all --dry-run                               # Preview sync all"
     echo "  $0 delete-chain 2025-06-26_08-57-49_full_* --dry-run # Preview delete incrementals"
