@@ -9,6 +9,7 @@
 #   xtrabackup-s3.sh delete-chain <full-backup> [--dry-run]
 #   xtrabackup-s3.sh sync <backup-folder> [--dry-run]
 #   xtrabackup-s3.sh sync-all [--dry-run]
+#   xtrabackup-s3.sh analyze-chains
 
 CFG_EXTRA_LSN_DIR="/var/backups/mysql_lsn"
 CFG_HOSTNAME=$(hostname)
@@ -55,27 +56,187 @@ if [ $# -gt 0 ]; then
 fi
 
 cleanup_old_backups() {
-    echo "Starting cleanup of old backups..."
+    echo "Starting chain-aware cleanup of old backups..."
     CUTOFF_DATE=$(date -d "$CFG_CUTOFF_DAYS days ago" +%Y-%m-%d)
-
-    mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | while read -r FOLDER; do
-        FOLDER=$(echo "$FOLDER" | xargs)
-        FOLDER_DATE=$(echo "$FOLDER" | cut -d_ -f1)
-
-        if ! echo "$FOLDER_DATE" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
-            echo "Skipping invalid folder: $FOLDER"
+    echo "Cutoff date: $CUTOFF_DATE"
+    
+    # Get all backups and sort them
+    TEMP_FILE=$(mktemp)
+    mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | sed 's/\/$//' | sort > "$TEMP_FILE"
+    
+    # Find all full backups
+    FULL_BACKUPS=$(grep "_full_" "$TEMP_FILE")
+    
+    echo "Found full backups:"
+    echo "$FULL_BACKUPS"
+    echo ""
+    
+    # Process each full backup and its incremental chain
+    echo "$FULL_BACKUPS" | while read -r FULL_BACKUP; do
+        if [ -z "$FULL_BACKUP" ]; then
             continue
         fi
-
-        if [ "$FOLDER_DATE" \< "$CUTOFF_DATE" ]; then
-            if [ "$OPT_DRY_RUN" -eq 1 ]; then
-                echo "Would delete: $FOLDER"
+        
+        FULL_DATE=$(echo "$FULL_BACKUP" | cut -d_ -f1)
+        FULL_TIMESTAMP=$(echo "$FULL_BACKUP" | grep -o '[0-9]*$')
+        
+        # Skip if date format is invalid
+        if ! echo "$FULL_DATE" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
+            echo "Skipping invalid folder: $FULL_BACKUP"
+            continue
+        fi
+        
+        echo "Checking backup chain for: $FULL_BACKUP (date: $FULL_DATE)"
+        
+        # Find all incrementals for this full backup
+        INCREMENTALS=$(grep "_inc_base-${FULL_TIMESTAMP}_" "$TEMP_FILE" || true)
+        INCREMENTAL_COUNT=$(echo "$INCREMENTALS" | grep -c . || echo "0")
+        
+        echo "  Found $INCREMENTAL_COUNT incrementals for this full backup"
+        
+        # Check if this full backup is older than cutoff
+        if [ "$FULL_DATE" \< "$CUTOFF_DATE" ]; then
+            echo "  📅 Full backup $FULL_BACKUP is older than cutoff ($FULL_DATE < $CUTOFF_DATE)"
+            
+            # Check if any incrementals are newer than cutoff (should be preserved)
+            NEWER_INCREMENTALS=""
+            if [ -n "$INCREMENTALS" ]; then
+                NEWER_INCREMENTALS=$(echo "$INCREMENTALS" | while read -r inc; do
+                    if [ -n "$inc" ]; then
+                        INC_DATE=$(echo "$inc" | cut -d_ -f1)
+                        if [ "$INC_DATE" \> "$CUTOFF_DATE" ] || [ "$INC_DATE" = "$CUTOFF_DATE" ]; then
+                            echo "$inc"
+                        fi
+                    fi
+                done)
+            fi
+            
+            if [ -n "$NEWER_INCREMENTALS" ]; then
+                echo "  ⚠️  WARNING: Found incrementals newer than cutoff date:"
+                echo "$NEWER_INCREMENTALS" | while read -r newer_inc; do
+                    [ -n "$newer_inc" ] && echo "    - $newer_inc"
+                done
+                echo "  🔒 PRESERVING entire chain to avoid orphaning incrementals"
             else
-                echo "Deleting: $FOLDER"
-                mc rb --force "$CFG_MC_BUCKET_PATH/$FOLDER"
+                echo "  🗑️  Safe to delete: all incrementals are also older than cutoff"
+                
+                if [ "$OPT_DRY_RUN" -eq 1 ]; then
+                    echo "  [DRY RUN] Would delete full backup: $FULL_BACKUP"
+                    if [ -n "$INCREMENTALS" ]; then
+                        echo "$INCREMENTALS" | while read -r inc; do
+                            [ -n "$inc" ] && echo "  [DRY RUN] Would delete incremental: $inc"
+                        done
+                    fi
+                else
+                    echo "  Deleting full backup: $FULL_BACKUP"
+                    mc rb --force "$CFG_MC_BUCKET_PATH/$FULL_BACKUP"
+                    
+                    # Delete all incrementals for this full backup
+                    if [ -n "$INCREMENTALS" ]; then
+                        echo "$INCREMENTALS" | while read -r inc; do
+                            if [ -n "$inc" ]; then
+                                echo "  Deleting incremental: $inc"
+                                mc rb --force "$CFG_MC_BUCKET_PATH/$inc"
+                            fi
+                        done
+                    fi
+                fi
+            fi
+        else
+            echo "  ✅ Full backup $FULL_BACKUP is within retention period ($FULL_DATE >= $CUTOFF_DATE)"
+        fi
+        echo ""
+    done
+    
+    # Clean up orphaned incrementals (incrementals without a corresponding full backup)
+    echo "Checking for orphaned incrementals..."
+    ALL_INCREMENTALS=$(grep "_inc_base-" "$TEMP_FILE" || true)
+    
+    if [ -n "$ALL_INCREMENTALS" ]; then
+        echo "$ALL_INCREMENTALS" | while read -r inc; do
+            if [ -n "$inc" ]; then
+                # Extract the base timestamp
+                BASE_TIMESTAMP=$(echo "$inc" | sed 's/.*_inc_base-\([0-9]*\)_.*/\1/')
+                
+                # Check if corresponding full backup exists
+                CORRESPONDING_FULL=$(grep "_full_${BASE_TIMESTAMP}" "$TEMP_FILE" || true)
+                
+                if [ -z "$CORRESPONDING_FULL" ]; then
+                    INC_DATE=$(echo "$inc" | cut -d_ -f1)
+                    echo "  🚨 ORPHANED incremental found: $inc (base timestamp: $BASE_TIMESTAMP)"
+                    
+                    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+                        echo "  [DRY RUN] Would delete orphaned incremental: $inc"
+                    else
+                        echo "  Deleting orphaned incremental: $inc"
+                        mc rb --force "$CFG_MC_BUCKET_PATH/$inc"
+                    fi
+                fi
+            fi
+        done
+    else
+        echo "✅ No orphaned incrementals found"
+    fi
+    
+    rm -f "$TEMP_FILE"
+    echo "Chain-aware cleanup completed."
+}
+
+analyze_backup_chains() {
+    echo "=== BACKUP CHAIN ANALYSIS ==="
+    
+    # Show current backup chains
+    TEMP_FILE=$(mktemp)
+    mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | sed 's/\/$//' | sort > "$TEMP_FILE"
+    
+    FULL_BACKUPS=$(grep "_full_" "$TEMP_FILE")
+    
+    echo "Current backup chains:"
+    echo "$FULL_BACKUPS" | while read -r FULL_BACKUP; do
+        if [ -n "$FULL_BACKUP" ]; then
+            FULL_TIMESTAMP=$(echo "$FULL_BACKUP" | grep -o '[0-9]*$')
+            INCREMENTALS=$(grep "_inc_base-${FULL_TIMESTAMP}_" "$TEMP_FILE" | wc -l)
+            CHAIN_SIZE=$(mc du "$CFG_MC_BUCKET_PATH/$FULL_BACKUP" 2>/dev/null | awk '{print $1}' || echo "unknown")
+            
+            if [ "$INCREMENTALS" -gt 0 ]; then
+                OLDEST_INC=$(grep "_inc_base-${FULL_TIMESTAMP}_" "$TEMP_FILE" | head -1 | cut -d_ -f1)
+                NEWEST_INC=$(grep "_inc_base-${FULL_TIMESTAMP}_" "$TEMP_FILE" | tail -1 | cut -d_ -f1)
+                echo "📁 $FULL_BACKUP ($CHAIN_SIZE)"
+                echo "   ↳ $INCREMENTALS incrementals (${OLDEST_INC} → ${NEWEST_INC})"
+            else
+                echo "📁 $FULL_BACKUP ($CHAIN_SIZE) [standalone]"
             fi
         fi
     done
+    
+    # Find orphaned incrementals
+    echo ""
+    echo "Checking for orphaned incrementals..."
+    ALL_INCREMENTALS=$(grep "_inc_base-" "$TEMP_FILE" || true)
+    ORPHAN_COUNT=0
+    
+    if [ -n "$ALL_INCREMENTALS" ]; then
+        echo "$ALL_INCREMENTALS" | while read -r inc; do
+            if [ -n "$inc" ]; then
+                BASE_TIMESTAMP=$(echo "$inc" | sed 's/.*_inc_base-\([0-9]*\)_.*/\1/')
+                CORRESPONDING_FULL=$(grep "_full_${BASE_TIMESTAMP}" "$TEMP_FILE" || true)
+                
+                if [ -z "$CORRESPONDING_FULL" ]; then
+                    echo "🚨 ORPHANED: $inc (missing full backup with timestamp $BASE_TIMESTAMP)"
+                    ORPHAN_COUNT=$((ORPHAN_COUNT + 1))
+                fi
+            fi
+        done
+    fi
+    
+    if [ "$ORPHAN_COUNT" -eq 0 ]; then
+        echo "✅ No orphaned incrementals found"
+    fi
+    
+    rm -f "$TEMP_FILE"
+    echo ""
+    echo "=== END ANALYSIS ==="
+    echo ""
 }
 
 generate_report() {
@@ -381,7 +542,14 @@ elif [ "$OPT_BACKUP_TYPE" = "restore-chain" ]; then
     echo "Preparing full backup (with --apply-log-only)..."
     xtrabackup --prepare --apply-log-only --target-dir=/var/lib/mysql
 
+    # Check if the initial prepare succeeded before proceeding with incrementals
+    if [ $? -ne 0 ]; then
+        echo "❌ Full backup prepare failed! Aborting restore."
+        exit 1
+    fi
+
     if [ -n "$INCREMENTALS" ]; then
+        RESTORE_SUCCESS=1
         echo "$INCREMENTALS" | while read -r inc; do
             echo ""
             echo "Processing incremental: $inc"
@@ -401,12 +569,33 @@ elif [ "$OPT_BACKUP_TYPE" = "restore-chain" ]; then
             
             echo "Applying incremental backup..."
             xtrabackup --prepare --apply-log-only --target-dir=/var/lib/mysql --incremental-dir="$RESTORE_TMP/$inc"
+            
+            # Check if the incremental apply succeeded
+            if [ $? -ne 0 ]; then
+                echo "❌ Failed to apply incremental backup: $inc"
+                echo "🔍 Check LSN compatibility between full backup and this incremental"
+                echo "💡 You may need to use a different full backup or incremental chain"
+                exit 1
+            fi
+            
+            echo "✅ Successfully applied incremental: $inc"
         done
+        
+        # Check if we reached here successfully
+        if [ $? -ne 0 ]; then
+            echo "❌ Incremental chain restore failed!"
+            exit 1
+        fi
     fi
 
     echo ""
     echo "Final prepare (without --apply-log-only)..."
     xtrabackup --prepare --target-dir=/var/lib/mysql
+
+    if [ $? -ne 0 ]; then
+        echo "❌ Final prepare failed!"
+        exit 1
+    fi
 
     echo "Fixing permissions..."
     chown -R mysql:mysql /var/lib/mysql
@@ -428,7 +617,7 @@ elif [ "$OPT_BACKUP_TYPE" = "delete-chain" ]; then
     FULL_BACKUP=$(echo $BACKUP_ARGUMENTS | awk '{print $1}')
     [ -z "$FULL_BACKUP" ] && { echo "ERROR: No full backup specified for chain deletion."; exit 1; }
 
-    FULL_TIMESTAMP=$(echo "$FULL_BACKUP" | grep -o '[0-9]*$')
+    FULL_TIMESTAMP=$(echo "$FULL_BACKUP" | grep -o '[0-9]*)
     [ -z "$FULL_TIMESTAMP" ] && { echo "ERROR: Could not extract timestamp from backup name: $FULL_BACKUP"; exit 1; }
 
     if [ "$OPT_DRY_RUN" -eq 1 ]; then
@@ -590,10 +779,17 @@ elif [ "$OPT_BACKUP_TYPE" = "sync-all" ]; then
 elif [ "$OPT_BACKUP_TYPE" = "list" ]; then
     list_backups
 
+elif [ "$OPT_BACKUP_TYPE" = "analyze-chains" ]; then
+    if [ -z "$BACKUP_ARGUMENTS" ]; then
+        echo "Error: No backup chain specified"
+        exit 1
+    fi
+    analyze_backup_chains "$BACKUP_ARGUMENTS"
+
 else
     echo "MySQL XtraBackup S3 Management Script"
     echo ""
-    echo "Usage: $0 {full|inc|list|delete-chain|sync|sync-all|restore-chain} [OPTIONS]"
+    echo "Usage: $0 {full|inc|list|delete-chain|sync|sync-all|restore-chain|analyze-chains} [OPTIONS]"
     echo ""
     echo "COMMANDS:"
     echo "  full                    Create full backup"
@@ -604,6 +800,7 @@ else
     echo "  delete-chain <backup>   Delete all incrementals for a full backup"
     echo "  sync <backup-folder>    Sync specific backup to S3"
     echo "  sync-all               Sync all local backups to S3"
+    echo "  analyze-chains         Analyze backup chains and find orphans"
     echo ""
     echo "OPTIONS:"
     echo "  --dry-run              Show what would be done without executing"
@@ -615,13 +812,15 @@ else
     echo "  $0 full --cleanup                                    # Full backup with cleanup"
     echo "  $0 inc --no-sync                                     # Incremental backup, no S3 sync"
     echo "  $0 list                                              # Show backup chains"
-    echo "  $0 restore 2025-06-26_08-57-49_full_1750928269      # Restore full backup only"
-    echo "  $0 restore-chain 2025-06-26_08-57-49_full_1750928269 # Restore full + all incrementals"
-    echo "  $0 restore-chain 2025-06-26_13-11-05_inc_base-*     # Restore up to specific incremental"
-    echo "  $0 restore-chain 2025-06-26_13-11-05_inc_base-* --restore-dir=/mnt/restore # Custom restore dir"
-    echo "  $0 sync 2025-06-26_13-11-05_inc_base-1750928269_*   # Sync specific backup"
+    echo "  $0 analyze-chains <backup-pattern>               # Analyze backup chain"
+    echo "  $0 restore 2025-07-06_06-00-03_full_1751781603      # Restore full backup only"
+    echo "  $0 restore-chain 2025-07-06_06-00-03_full_1751781603 # Restore full + all incrementals"
+    echo "  $0 restore-chain 2025-07-03_23-00-03_inc_base-*     # Restore up to specific incremental"
+    echo "  $0 restore-chain 2025-07-03_23-00-03_inc_base-* --restore-dir=/mnt/restore # Custom restore dir"
+    echo "  $0 sync 2025-07-03_23-00-03_inc_base-1751482801_*   # Sync specific backup"
     echo "  $0 sync-all --dry-run                               # Preview sync all"
-    echo "  $0 delete-chain 2025-06-26_08-57-49_full_* --dry-run # Preview delete incrementals"
+    echo "  $0 delete-chain 2025-07-06_06-00-03_full_* --dry-run # Preview delete incrementals"
+    echo "  $0 full --cleanup --dry-run                         # Preview cleanup with chain analysis"
     exit 1
 fi
 
