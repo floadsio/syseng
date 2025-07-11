@@ -9,7 +9,7 @@
 #   xtrabackup-s3.sh delete-chain <full-backup> [--dry-run]
 #   xtrabackup-s3.sh sync <backup-folder> [--dry-run]
 #   xtrabackup-s3.sh sync-all [--dry-run]
-#   xtrabackup-s3.sh analyze-chains
+#   xtrabackup-s3.sh analyze-chain
 
 CFG_EXTRA_LSN_DIR="/var/backups/mysql_lsn"
 CFG_HOSTNAME=$(hostname)
@@ -617,7 +617,7 @@ elif [ "$OPT_BACKUP_TYPE" = "delete-chain" ]; then
     FULL_BACKUP=$(echo $BACKUP_ARGUMENTS | awk '{print $1}')
     [ -z "$FULL_BACKUP" ] && { echo "ERROR: No full backup specified for chain deletion."; exit 1; }
 
-    FULL_TIMESTAMP=$(echo "$FULL_BACKUP" | grep -o '[0-9]*)
+    FULL_TIMESTAMP=$(echo "$FULL_BACKUP" | grep -o '[0-9]*$')
     [ -z "$FULL_TIMESTAMP" ] && { echo "ERROR: Could not extract timestamp from backup name: $FULL_BACKUP"; exit 1; }
 
     if [ "$OPT_DRY_RUN" -eq 1 ]; then
@@ -642,7 +642,7 @@ elif [ "$OPT_BACKUP_TYPE" = "delete-chain" ]; then
                 echo "  Would delete: $inc_folder ($size)"
             fi
         done
-        
+
         echo ""
         echo "NOTE: The full backup itself will NOT be deleted"
         exit 0
@@ -666,7 +666,7 @@ elif [ "$OPT_BACKUP_TYPE" = "delete-chain" ]; then
         fi
     done
 
-    echo "✅ Incremental backup chain deletion completed for: $FULL_BACKUP"
+    echo "Incremental backup chain deletion completed for: $FULL_BACKUP"
 
 elif [ "$OPT_BACKUP_TYPE" = "sync" ]; then
     BACKUP_FOLDER=$(echo $BACKUP_ARGUMENTS | awk '{print $1}')
@@ -779,7 +779,7 @@ elif [ "$OPT_BACKUP_TYPE" = "sync-all" ]; then
 elif [ "$OPT_BACKUP_TYPE" = "list" ]; then
     list_backups
 
-elif [ "$OPT_BACKUP_TYPE" = "analyze-chains" ]; then
+elif [ "$OPT_BACKUP_TYPE" = "analyze-chain" ]; then
     if [ -z "$BACKUP_ARGUMENTS" ]; then
         echo "Error: No backup chain specified"
         exit 1
@@ -789,7 +789,7 @@ elif [ "$OPT_BACKUP_TYPE" = "analyze-chains" ]; then
 else
     echo "MySQL XtraBackup S3 Management Script"
     echo ""
-    echo "Usage: $0 {full|inc|list|delete-chain|sync|sync-all|restore-chain|analyze-chains} [OPTIONS]"
+    echo "Usage: $0 {full|inc|list|delete-chain|sync|sync-all|restore-chain|analyze-chain} [OPTIONS]"
     echo ""
     echo "COMMANDS:"
     echo "  full                    Create full backup"
@@ -800,7 +800,7 @@ else
     echo "  delete-chain <backup>   Delete all incrementals for a full backup"
     echo "  sync <backup-folder>    Sync specific backup to S3"
     echo "  sync-all               Sync all local backups to S3"
-    echo "  analyze-chains         Analyze backup chains and find orphans"
+    echo "  analyze-chain         Analyze backup chains and find orphans"
     echo ""
     echo "OPTIONS:"
     echo "  --dry-run              Show what would be done without executing"
@@ -812,7 +812,7 @@ else
     echo "  $0 full --cleanup                                    # Full backup with cleanup"
     echo "  $0 inc --no-sync                                     # Incremental backup, no S3 sync"
     echo "  $0 list                                              # Show backup chains"
-    echo "  $0 analyze-chains <backup-pattern>               # Analyze backup chain"
+    echo "  $0 analyze-chain <backup-pattern>               # Analyze backup chain"
     echo "  $0 restore 2025-07-06_06-00-03_full_1751781603      # Restore full backup only"
     echo "  $0 restore-chain 2025-07-06_06-00-03_full_1751781603 # Restore full + all incrementals"
     echo "  $0 restore-chain 2025-07-03_23-00-03_inc_base-*     # Restore up to specific incremental"
