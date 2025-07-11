@@ -9,7 +9,7 @@
 #   xtrabackup-s3.sh delete-chain <full-backup> [--dry-run]
 #   xtrabackup-s3.sh sync <backup-folder> [--dry-run]
 #   xtrabackup-s3.sh sync-all [--dry-run]
-#   xtrabackup-s3.sh analyze-chain
+#   xtrabackup-s3.sh analyze-chains
 
 CFG_EXTRA_LSN_DIR="/var/backups/mysql_lsn"
 CFG_HOSTNAME=$(hostname)
@@ -779,7 +779,7 @@ elif [ "$OPT_BACKUP_TYPE" = "sync-all" ]; then
 elif [ "$OPT_BACKUP_TYPE" = "list" ]; then
     list_backups
 
-elif [ "$OPT_BACKUP_TYPE" = "analyze-chain" ]; then
+elif [ "$OPT_BACKUP_TYPE" = "analyze-chains" ]; then
     if [ -z "$BACKUP_ARGUMENTS" ]; then
         echo "Error: No backup chain specified"
         exit 1
@@ -789,7 +789,7 @@ elif [ "$OPT_BACKUP_TYPE" = "analyze-chain" ]; then
 else
     echo "MySQL XtraBackup S3 Management Script"
     echo ""
-    echo "Usage: $0 {full|inc|list|delete-chain|sync|sync-all|restore-chain|analyze-chain} [OPTIONS]"
+    echo "Usage: $0 {full|inc|list|delete-chain|sync|sync-all|restore-chain|analyze-chains} [OPTIONS]"
     echo ""
     echo "COMMANDS:"
     echo "  full                    Create full backup"
@@ -800,7 +800,7 @@ else
     echo "  delete-chain <backup>   Delete all incrementals for a full backup"
     echo "  sync <backup-folder>    Sync specific backup to S3"
     echo "  sync-all               Sync all local backups to S3"
-    echo "  analyze-chain         Analyze backup chains and find orphans"
+    echo "  analyze-chains         Analyze backup chains and find orphans"
     echo ""
     echo "OPTIONS:"
     echo "  --dry-run              Show what would be done without executing"
@@ -812,7 +812,7 @@ else
     echo "  $0 full --cleanup                                    # Full backup with cleanup"
     echo "  $0 inc --no-sync                                     # Incremental backup, no S3 sync"
     echo "  $0 list                                              # Show backup chains"
-    echo "  $0 analyze-chain <backup-pattern>               # Analyze backup chain"
+    echo "  $0 analyze-chains <backup-pattern>               # Analyze backup chain"
     echo "  $0 restore 2025-07-06_06-00-03_full_1751781603      # Restore full backup only"
     echo "  $0 restore-chain 2025-07-06_06-00-03_full_1751781603 # Restore full + all incrementals"
     echo "  $0 restore-chain 2025-07-03_23-00-03_inc_base-*     # Restore up to specific incremental"
