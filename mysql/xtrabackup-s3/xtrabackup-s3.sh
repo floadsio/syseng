@@ -184,54 +184,28 @@ analyze_backup_chains() {
     echo "=== END ANALYSIS ==="
 }
 
-# Function to list backups
 list_backups() {
     echo "=== LOCAL BACKUPS ==="
     if [ -n "$CFG_LOCAL_BACKUP_DIR" ] && [ -d "$CFG_LOCAL_BACKUP_DIR" ]; then
-        find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "*_full_*" | sort -r | while read full_backup; do
-            if [ -d "$full_backup" ]; then
-                backup_name=`basename "$full_backup"`
-                size=`du -sh "$full_backup" 2>/dev/null | cut -f1`
-                timestamp=`echo "$backup_name" | grep -o '[0-9]*$'`
-                echo "$backup_name ($size) [FULL]"
-                
-                find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "*_inc_base-${timestamp}_*" | sort | while read inc_backup; do
-                    if [ -d "$inc_backup" ]; then
-                        inc_name=`basename "$inc_backup"`
-                        inc_size=`du -sh "$inc_backup" 2>/dev/null | cut -f1`
-                        echo "  -> $inc_name ($inc_size) [INC]"
-                    fi
-                done
-            fi
+        find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "20*" | sort -r | while read -r backup; do
+            backup_name=$(basename "$backup")
+            size=$(du -sh "$backup" 2>/dev/null | cut -f1)
+            echo "  $backup_name ($size)"
         done
     else
         echo "  No local backup directory configured or found"
     fi
-    
-    if [ "$OPT_LOCAL_ONLY" -eq 1 ]; then
-        echo ""
-        echo "=== S3 BACKUPS SKIPPED (--local-only mode) ==="
+
+    echo ""
+    echo "=== REMOTE BACKUPS (S3) ==="
+    if mc ls "$CFG_MC_BUCKET_PATH" >/dev/null 2>&1; then
+        mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | sort -r | while read -r folder; do
+            folder=$(echo "$folder" | xargs)
+            size=$(mc du "$CFG_MC_BUCKET_PATH/$folder" 2>/dev/null | awk '{print $1}' || echo "unknown")
+            echo "  $folder ($size)"
+        done
     else
-        echo ""
-        echo "=== REMOTE BACKUPS (S3) ==="
-        if mc ls "$CFG_MC_BUCKET_PATH" >/dev/null 2>&1; then
-            mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | grep "_full_" | sort -r | while read full_folder; do
-                full_folder=`echo "$full_folder" | sed 's/\/$//'`
-                if [ -n "$full_folder" ]; then
-                    timestamp=`echo "$full_folder" | grep -o '[0-9]*$'`
-                    echo "$full_folder [FULL]"
-                    
-                    mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | grep "_inc_base-${timestamp}_" | sort | while read inc_folder; do
-                        inc_folder=`echo "$inc_folder" | sed 's/\/$//'`
-                        if [ -n "$inc_folder" ]; then
-                            echo "  -> $inc_folder [INC]"
-                        fi
-                    done
-                fi
-            done
-        else
-            echo "  Could not access remote backups (check mc config)"
-        fi
+        echo "  Could not access remote backups (check mc config)"
     fi
 }
 
