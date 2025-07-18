@@ -174,7 +174,7 @@ Perfect for environments without S3 access or purely local backup strategies:
 | `full` | Create full backup | Optional |
 | `inc` | Create incremental backup | Optional |
 | `list` | List all backups | Optional |
-| `restore <backup>` | Restore from full backup | Yes |
+| `restore <backup>` | Restore from full backup | **No** (prefers local) |
 | `sync <folder>` | Sync specific backup to S3 | Yes |
 | `sync-all` | Sync all local backups to S3 | Yes |
 | `delete-chain <backup>` | Delete incrementals for a full backup | Yes |
@@ -196,20 +196,46 @@ Perfect for environments without S3 access or purely local backup strategies:
 ./xtrabackup-s3.sh full --cleanup --dry-run
 ```
 
-### Database-Specific Examples
+## Restore Operations
 
-**MariaDB Galera Cluster:**
+### Smart Restore Logic
+
+The `restore` command intelligently chooses between local and S3 backups:
+
+1. **Checks local backups first** - if backup exists locally, uses it directly
+2. **Falls back to S3** - if not found locally, downloads from S3
+3. **Automatic detection** - no need to specify source location
+
 ```bash
-# The script automatically detects Galera and adds --galera-info
-./xtrabackup-s3.sh full --local-only
-# Output: "Galera cluster detected - adding --galera-info option"
+# Restore from local backup (if available) or S3
+./xtrabackup-s3.sh restore 2025-07-18_08-57-49_full_1750928269
+
+# Preview restore operation
+./xtrabackup-s3.sh restore 2025-07-18_08-57-49_full_1750928269 --dry-run
 ```
 
-**MySQL/Percona:**
+### Restore Examples
+
+**Local-Only Environment:**
 ```bash
-# Uses xtrabackup with --extra-lsndir support
-./xtrabackup-s3.sh full
-# Output: "MySQL/Percona detected - using xtrabackup"
+# List local backups
+./xtrabackup-s3.sh list --local-only
+
+# Restore from local backup (no S3 required)
+./xtrabackup-s3.sh restore 2025-07-18_08-57-49_full_1750928269
+
+# Output: "Using local backup: /mnt/backup/2025-07-18_08-57-49_full_1750928269"
+```
+
+**S3-Integrated Environment:**
+```bash
+# List all backups
+./xtrabackup-s3.sh list
+
+# Restore - will use local if available, otherwise S3
+./xtrabackup-s3.sh restore 2025-07-18_08-57-49_full_1750928269
+
+# Output: "Using S3 backup: s3://bucket/2025-07-18_08-57-49_full_1750928269"
 ```
 
 ## Backup Chain Structure
@@ -420,6 +446,11 @@ mysql-backups/hostname/
 3. **"Configuration file not found"**
    - Create `~/.xtrabackup-s3.conf` with required settings
    - See configuration section above
+
+4. **"Backup not found for restore"**
+   - Check local backups: `./xtrabackup-s3.sh list --local-only`
+   - Check S3 backups: `./xtrabackup-s3.sh list`
+   - Verify backup name spelling
 
 ### Debugging
 

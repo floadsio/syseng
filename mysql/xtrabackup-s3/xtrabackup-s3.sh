@@ -382,11 +382,26 @@ elif [ "$OPT_BACKUP_TYPE" = "restore" ]; then
 
     detect_backup_tool
 
+    # Check if backup exists locally first
+    if [ -d "$CFG_LOCAL_BACKUP_DIR/$FULL_BACKUP" ]; then
+        BACKUP_SOURCE="$CFG_LOCAL_BACKUP_DIR/$FULL_BACKUP"
+        BACKUP_LOCATION="local"
+        echo "Using local backup: $BACKUP_SOURCE"
+    else
+        BACKUP_SOURCE="${CFG_MC_BUCKET_PATH}/${FULL_BACKUP}"
+        BACKUP_LOCATION="s3"
+        echo "Using S3 backup: $BACKUP_SOURCE"
+    fi
+
     if [ "$OPT_DRY_RUN" -eq 1 ]; then
         echo "# Dry run: showing what would be executed"
         echo "systemctl stop mysql"
         echo "rm -rf /var/lib/mysql/*"
-        echo "mc mirror --overwrite --remove \"${CFG_MC_BUCKET_PATH}/${FULL_BACKUP}\" /var/lib/mysql"
+        if [ "$BACKUP_LOCATION" = "local" ]; then
+            echo "cp -r \"$BACKUP_SOURCE\"/* /var/lib/mysql/"
+        else
+            echo "mc mirror --overwrite --remove \"$BACKUP_SOURCE\" /var/lib/mysql"
+        fi
         echo "$BACKUP_CMD --prepare --target-dir=/var/lib/mysql"
         echo "systemctl start mysql"
         exit 0
@@ -400,8 +415,12 @@ elif [ "$OPT_BACKUP_TYPE" = "restore" ]; then
     chown mysql:mysql /var/lib/mysql
     chmod 0750 /var/lib/mysql
 
-    echo "Restoring full backup: $FULL_BACKUP"
-    mc mirror --overwrite --remove "${CFG_MC_BUCKET_PATH}/${FULL_BACKUP}" /var/lib/mysql
+    echo "Restoring full backup from $BACKUP_LOCATION: $FULL_BACKUP"
+    if [ "$BACKUP_LOCATION" = "local" ]; then
+        cp -r "$BACKUP_SOURCE"/* /var/lib/mysql/
+    else
+        mc mirror --overwrite --remove "$BACKUP_SOURCE" /var/lib/mysql
+    fi
 
     echo "Preparing restored data..."
     if [ "$BACKUP_TOOL" = "mariabackup" ]; then
@@ -424,7 +443,7 @@ elif [ "$OPT_BACKUP_TYPE" = "restore" ]; then
     echo "Starting MySQL..."
     systemctl start mysql
 
-    echo "✅ Full backup restored successfully from: $FULL_BACKUP"
+    echo "✅ Full backup restored successfully from $BACKUP_LOCATION: $FULL_BACKUP"
 
 elif [ "$OPT_BACKUP_TYPE" = "sync" ]; then
     BACKUP_FOLDER=`echo $BACKUP_ARGUMENTS | awk '{print $1}'`
