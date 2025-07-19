@@ -1,570 +1,518 @@
 #!/bin/sh
+# shellcheck shell=sh
 
-# Universal MySQL/MariaDB XtraBackup S3 Script
-# Supports both xtrabackup (MySQL/Percona) and mariabackup (MariaDB/Galera)
+##############################################################################
+# Universal MySQL / MariaDB XtraBackup → S3 Script  (pure POSIX /bin/sh)
+# Maintainer : you            Last update : 19 Jul 2025
+##############################################################################
 
+set -e
+
+# ---------------------------------------------------------------------------
+# Static placeholders (kept for compatibility / hooks)
+# ---------------------------------------------------------------------------
+# shellcheck disable=SC2034
 CFG_EXTRA_LSN_DIR="/var/backups/mysql_lsn"
-CFG_HOSTNAME=`hostname`
-CFG_DATE=`date +%Y-%m-%d_%H-%M-%S`
-CFG_TIMESTAMP=`date +%s`
+# shellcheck disable=SC2034
+CFG_HOSTNAME=$(hostname)
+CFG_DATE=$(date +%Y-%m-%d_%H-%M-%S)
+CFG_TIMESTAMP=$(date +%s)
+# shellcheck disable=SC2034
 CFG_INCREMENTAL=""
 
-# Backup tool detection variables
-BACKUP_TOOL=""
-BACKUP_CMD=""
-GALERA_OPTIONS=""
+BACKUP_TOOL="" BACKUP_CMD="" GALERA_OPTIONS=""
 
+# ---------------------------------------------------------------------------
+# Load user configuration (~/.xtrabackup-s3.conf)
+# ---------------------------------------------------------------------------
 CONFIG_FILE="$HOME/.xtrabackup-s3.conf"
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo "ERROR: Configuration file $CONFIG_FILE not found."
-    exit 1
-fi
-
+[ -f "$CONFIG_FILE" ] || { echo "ERROR: $CONFIG_FILE not found." >&2; exit 1; }
+# shellcheck disable=SC1090
 . "$CONFIG_FILE"
 
-if [ -z "$CFG_MC_BUCKET_PATH" ] || [ -z "$CFG_CUTOFF_DAYS" ] || [ -z "$CFG_LOCAL_BACKUP_DIR" ]; then
-    echo "ERROR: Required configuration (CFG_MC_BUCKET_PATH, CFG_CUTOFF_DAYS, CFG_LOCAL_BACKUP_DIR) is missing."
-    exit 1
+# mandatory settings
+if [ -z "$CFG_MC_BUCKET_PATH" ] || [ -z "$CFG_CUTOFF_DAYS" ] || \
+   [ -z "$CFG_LOCAL_BACKUP_DIR" ]; then
+  echo "ERROR: CFG_MC_BUCKET_PATH, CFG_CUTOFF_DAYS and CFG_LOCAL_BACKUP_DIR are mandatory." >&2
+  exit 1
 fi
 
-OPT_BACKUP_TYPE="${1:-}"
-OPT_DRY_RUN=0
-OPT_CLEANUP=0
-OPT_NO_SYNC=0
-OPT_LOCAL_ONLY=0
+##############################################################################
+# CLI parsing
+##############################################################################
+OPT_BACKUP_TYPE=${1:-}
+OPT_DRY_RUN=0 OPT_CLEANUP=0 OPT_NO_SYNC=0 OPT_LOCAL_ONLY=0
 OPT_RESTORE_DIR=""
+BACKUP_ARGUMENTS=""
 
-# Function to detect database type and set backup tool
-detect_backup_tool() {
-    echo "Detecting database type and backup tool..."
-    
-    # Check if mariabackup is available
-    if command -v mariabackup >/dev/null 2>&1; then
-        BACKUP_TOOL="mariabackup"
-        BACKUP_CMD="mariabackup"
-        echo "MariaDB detected - using mariabackup"
-        
-        # Check if this is a Galera cluster
-        if mysql --defaults-file=/root/.my.cnf -e "SHOW STATUS LIKE 'wsrep_cluster_size'" 2>/dev/null | grep -q wsrep_cluster_size; then
-            GALERA_OPTIONS="--galera-info"
-            echo "Galera cluster detected - adding --galera-info option"
-        else
-            echo "Standalone MariaDB instance detected"
-        fi
-        
-    # Check if xtrabackup is available  
-    elif command -v xtrabackup >/dev/null 2>&1; then
-        BACKUP_TOOL="xtrabackup"
-        BACKUP_CMD="xtrabackup"
-        echo "MySQL/Percona detected - using xtrabackup"
-        GALERA_OPTIONS=""
-        
-    else
-        echo "ERROR: No backup tool found!"
-        echo "Please install either:"
-        echo "  - mariabackup (for MariaDB): apt install mariadb-backup"
-        echo "  - xtrabackup (for MySQL/Percona): apt install percona-xtrabackup-80"
-        exit 1
-    fi
-    
-    echo "Using backup tool: $BACKUP_CMD $GALERA_OPTIONS"
-    echo ""
-}
-
-# Parse command line arguments
 if [ $# -gt 0 ]; then
+  shift
+  while [ "$1" ]; do
+    case "$1" in
+      --dry-run)       OPT_DRY_RUN=1 ;;
+      --cleanup)       OPT_CLEANUP=1 ;;
+      --no-sync)       OPT_NO_SYNC=1 ;;
+      --local-only)    OPT_LOCAL_ONLY=1 ;;
+      --restore-dir=*) OPT_RESTORE_DIR=${1#*=} ;;
+      *)               BACKUP_ARGUMENTS="$BACKUP_ARGUMENTS $1" ;;
+    esac
     shift
-    while [ "$1" != "" ]; do
-        case "$1" in
-            --dry-run) OPT_DRY_RUN=1 ;;
-            --cleanup) OPT_CLEANUP=1 ;;
-            --no-sync) OPT_NO_SYNC=1 ;;
-            --local-only) OPT_LOCAL_ONLY=1 ;;
-            --restore-dir=*) 
-                OPT_RESTORE_DIR=`echo "$1" | cut -d= -f2`
-                ;;
-            *) 
-                BACKUP_ARGUMENTS="$BACKUP_ARGUMENTS $1"
-                ;;
-        esac
-        shift
-    done
+  done
 fi
 
-# Function to cleanup old backups
-cleanup_old_backups() {
-    echo "Starting chain-aware cleanup of old backups..."
-    CUTOFF_DATE=`date -d "$CFG_CUTOFF_DAYS days ago" +%Y-%m-%d`
-    echo "Cutoff date: $CUTOFF_DATE"
-    
-    # Get all backups and sort them
-    TEMP_FILE=`mktemp`
-    mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | sed 's/\/$//' | sort > "$TEMP_FILE"
-    
-    # Find all full backups
-    FULL_BACKUPS=`grep "_full_" "$TEMP_FILE"`
-    
-    echo "Found full backups:"
-    echo "$FULL_BACKUPS"
-    echo ""
-    
-    # Process each full backup and its incremental chain
-    echo "$FULL_BACKUPS" | while read FULL_BACKUP; do
-        if [ -z "$FULL_BACKUP" ]; then
-            continue
-        fi
-        
-        FULL_DATE=`echo "$FULL_BACKUP" | cut -d_ -f1`
-        FULL_TIMESTAMP=`echo "$FULL_BACKUP" | grep -o '[0-9]*$'`
-        
-        echo "Checking backup chain for: $FULL_BACKUP (date: $FULL_DATE)"
-        
-        # Find all incrementals for this full backup
-        INCREMENTALS=`grep "_inc_base-${FULL_TIMESTAMP}_" "$TEMP_FILE" || true`
-        
-        if [ "$FULL_DATE" \< "$CUTOFF_DATE" ]; then
-            echo "  Full backup $FULL_BACKUP is older than cutoff"
-            
-            if [ "$OPT_DRY_RUN" -eq 1 ]; then
-                echo "  [DRY RUN] Would delete full backup: $FULL_BACKUP"
-                if [ -n "$INCREMENTALS" ]; then
-                    echo "$INCREMENTALS" | while read inc; do
-                        [ -n "$inc" ] && echo "  [DRY RUN] Would delete incremental: $inc"
-                    done
-                fi
-            else
-                echo "  Deleting full backup: $FULL_BACKUP"
-                mc rb --force "$CFG_MC_BUCKET_PATH/$FULL_BACKUP"
-                
-                if [ -n "$INCREMENTALS" ]; then
-                    echo "$INCREMENTALS" | while read inc; do
-                        if [ -n "$inc" ]; then
-                            echo "  Deleting incremental: $inc"
-                            mc rb --force "$CFG_MC_BUCKET_PATH/$inc"
-                        fi
-                    done
-                fi
-            fi
-        else
-            echo "  Full backup $FULL_BACKUP is within retention period"
-        fi
-        echo ""
-    done
-    
-    rm -f "$TEMP_FILE"
-    echo "Chain-aware cleanup completed."
-}
-
-# Function to analyze backup chains
-analyze_backup_chains() {
-    echo "=== BACKUP CHAIN ANALYSIS ==="
-    
-    TEMP_FILE=`mktemp`
-    mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | sed 's/\/$//' | sort > "$TEMP_FILE"
-    
-    FULL_BACKUPS=`grep "_full_" "$TEMP_FILE"`
-    
-    echo "Current backup chains:"
-    echo "$FULL_BACKUPS" | while read FULL_BACKUP; do
-        if [ -n "$FULL_BACKUP" ]; then
-            FULL_TIMESTAMP=`echo "$FULL_BACKUP" | grep -o '[0-9]*$'`
-            INCREMENTALS_COUNT=`grep "_inc_base-${FULL_TIMESTAMP}_" "$TEMP_FILE" | wc -l`
-            
-            if [ "$INCREMENTALS_COUNT" -gt 0 ]; then
-                echo "📁 $FULL_BACKUP"
-                echo "   ↳ $INCREMENTALS_COUNT incrementals"
-            else
-                echo "📁 $FULL_BACKUP [standalone]"
-            fi
-        fi
-    done
-    
-    rm -f "$TEMP_FILE"
-    echo ""
-    echo "=== END ANALYSIS ==="
-}
-
-list_backups() {
-    echo "=== LOCAL BACKUPS ==="
-    if [ -n "$CFG_LOCAL_BACKUP_DIR" ] && [ -d "$CFG_LOCAL_BACKUP_DIR" ]; then
-        find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "20*" | sort -r | while read -r backup; do
-            backup_name=$(basename "$backup")
-            size=$(du -sh "$backup" 2>/dev/null | cut -f1)
-            echo "  $backup_name ($size)"
-        done
-    else
-        echo "  No local backup directory configured or found"
+##############################################################################
+detect_backup_tool() {
+  if command -v mariabackup >/dev/null 2>&1; then
+    BACKUP_TOOL=mariabackup BACKUP_CMD=mariabackup
+    if mysql --defaults-file=/root/.my.cnf \
+         -e "SHOW STATUS LIKE 'wsrep_cluster_size'" 2>/dev/null |
+         grep -q wsrep_cluster_size; then
+      CLUSTER_SIZE=$(mysql --defaults-file=/root/.my.cnf \
+        -e "SHOW STATUS LIKE 'wsrep_cluster_size'" 2>/dev/null |
+        awk '/wsrep_cluster_size/ {print $2}')
+      if [ -n "$CLUSTER_SIZE" ] && [ "$CLUSTER_SIZE" -gt 0 ]; then
+        GALERA_OPTIONS="--galera-info"
+      fi
     fi
-
-    echo ""
-    echo "=== REMOTE BACKUPS (S3) ==="
-    if mc ls "$CFG_MC_BUCKET_PATH" >/dev/null 2>&1; then
-        mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | sort -r | while read -r folder; do
-            folder=$(echo "$folder" | xargs)
-            size=$(mc du "$CFG_MC_BUCKET_PATH/$folder" 2>/dev/null | awk '{print $1}' || echo "unknown")
-            echo "  $folder ($size)"
-        done
-    else
-        echo "  Could not access remote backups (check mc config)"
-    fi
-}
-
-# Main logic starts here
-if [ "$OPT_BACKUP_TYPE" = "full" ] || [ "$OPT_BACKUP_TYPE" = "inc" ]; then
-    # Detect backup tool before running any backup operations
-    detect_backup_tool
-    
-    if [ -z "$CFG_LOCAL_BACKUP_DIR" ]; then
-        echo "ERROR: CFG_LOCAL_BACKUP_DIR must be configured for all backup operations."
-        exit 1
-    fi
-
-    if [ "$OPT_BACKUP_TYPE" = "inc" ]; then
-        LATEST_BACKUP=`find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "20*" | sort -r | head -n 1`
-        if [ -z "$LATEST_BACKUP" ]; then
-            echo "No previous backup found in $CFG_LOCAL_BACKUP_DIR. Please run a full backup first."
-            exit 1
-        fi
-
-        LATEST_BACKUP_NAME=`basename "$LATEST_BACKUP"`
-        if echo "$LATEST_BACKUP_NAME" | grep -q "_full_"; then
-            BASE_TIMESTAMP=`echo "$LATEST_BACKUP_NAME" | grep -o '[0-9]*$'`
-        else
-            BASE_TIMESTAMP=`echo "$LATEST_BACKUP_NAME" | sed 's/.*_inc_base-\([0-9]*\)_.*/\1/'`
-        fi
-
-        CFG_INCREMENTAL="--incremental-basedir=$LATEST_BACKUP"
-        LOCAL_BACKUP_DIR="${CFG_LOCAL_BACKUP_DIR}/${CFG_DATE}_${OPT_BACKUP_TYPE}_base-${BASE_TIMESTAMP}_${CFG_TIMESTAMP}"
-
-        if [ "$OPT_DRY_RUN" -eq 1 ]; then
-            echo "Dry run: would run incremental backup"
-            echo "Backup tool: $BACKUP_CMD $GALERA_OPTIONS"
-            echo "Base backup: $LATEST_BACKUP"
-            echo "Would create: $LOCAL_BACKUP_DIR"
-            if [ "$OPT_NO_SYNC" -eq 1 ] || [ "$OPT_LOCAL_ONLY" -eq 1 ]; then
-                echo "Would skip S3 sync (local backup only)"
-            else
-                LOCAL_BACKUP_NAME=`basename "$LOCAL_BACKUP_DIR"`
-                echo "Would mirror to: $CFG_MC_BUCKET_PATH/$LOCAL_BACKUP_NAME"
-            fi
-        else
-            mkdir -p "$LOCAL_BACKUP_DIR"
-            
-            # Run backup with appropriate tool
-            if [ "$BACKUP_TOOL" = "mariabackup" ]; then
-                TEMP_CNF=`mktemp`
-                echo "[mariabackup]" > "$TEMP_CNF"
-                echo "user=root" >> "$TEMP_CNF"
-                if grep -q "^password" /root/.my.cnf 2>/dev/null; then
-                    grep "^password" /root/.my.cnf >> "$TEMP_CNF"
-                fi
-                
-                $BACKUP_CMD --defaults-file="$TEMP_CNF" --backup ${CFG_INCREMENTAL} $GALERA_OPTIONS --target-dir="$LOCAL_BACKUP_DIR"
-                BACKUP_RESULT=$?
-                rm -f "$TEMP_CNF"
-            else
-                $BACKUP_CMD --backup ${CFG_INCREMENTAL} $GALERA_OPTIONS --extra-lsndir="$LOCAL_BACKUP_DIR" --target-dir="$LOCAL_BACKUP_DIR"
-                BACKUP_RESULT=$?
-            fi
-            
-            if [ $BACKUP_RESULT -ne 0 ]; then
-                echo "Incremental backup failed!"
-                exit 1
-            fi
-            
-            if [ "$OPT_NO_SYNC" -eq 1 ] || [ "$OPT_LOCAL_ONLY" -eq 1 ]; then
-                echo "`date '+%F %T'`: Incremental backup completed (local only, S3 sync skipped)"
-            else
-                LOCAL_BACKUP_NAME=`basename "$LOCAL_BACKUP_DIR"`
-                mc mirror --retry --overwrite "$LOCAL_BACKUP_DIR" "$CFG_MC_BUCKET_PATH/$LOCAL_BACKUP_NAME"
-                echo "`date '+%F %T'`: Incremental backup completed and mirrored to S3"
-            fi
-        fi
-    else
-        # Full backup
-        LOCAL_BACKUP_DIR="${CFG_LOCAL_BACKUP_DIR}/${CFG_DATE}_${OPT_BACKUP_TYPE}_${CFG_TIMESTAMP}"
-
-        if [ "$OPT_DRY_RUN" -eq 1 ]; then
-            echo "Dry run: would run full backup"
-            echo "Backup tool: $BACKUP_CMD $GALERA_OPTIONS"
-            echo "Would create: $LOCAL_BACKUP_DIR"
-            if [ "$OPT_NO_SYNC" -eq 1 ] || [ "$OPT_LOCAL_ONLY" -eq 1 ]; then
-                echo "Would skip S3 sync (local backup only)"
-            else
-                LOCAL_BACKUP_NAME=`basename "$LOCAL_BACKUP_DIR"`
-                echo "Would mirror to: $CFG_MC_BUCKET_PATH/$LOCAL_BACKUP_NAME"
-            fi
-        else
-            mkdir -p "$LOCAL_BACKUP_DIR"
-            
-            # Cleanup old local backups
-            KEEP_COUNT="${CFG_LOCAL_BACKUP_KEEP_COUNT:-4}"
-            BACKUP_COUNT=`find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "20*" | wc -l`
-            if [ "$BACKUP_COUNT" -gt "$KEEP_COUNT" ]; then
-                REMOVE_COUNT=`expr $BACKUP_COUNT - $KEEP_COUNT`
-                find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "20*" | sort | head -n "$REMOVE_COUNT" | while read OLD; do
-                    rm -rf "$OLD"
-                done
-            fi
-
-            # Run backup with appropriate tool
-            if [ "$BACKUP_TOOL" = "mariabackup" ]; then
-                TEMP_CNF=`mktemp`
-                echo "[mariabackup]" > "$TEMP_CNF"
-                echo "user=root" >> "$TEMP_CNF"
-                if grep -q "^password" /root/.my.cnf 2>/dev/null; then
-                    grep "^password" /root/.my.cnf >> "$TEMP_CNF"
-                fi
-                
-                $BACKUP_CMD --defaults-file="$TEMP_CNF" --backup $GALERA_OPTIONS --target-dir="$LOCAL_BACKUP_DIR"
-                BACKUP_RESULT=$?
-                rm -f "$TEMP_CNF"
-            else
-                $BACKUP_CMD --backup $GALERA_OPTIONS --extra-lsndir="$LOCAL_BACKUP_DIR" --target-dir="$LOCAL_BACKUP_DIR"
-                BACKUP_RESULT=$?
-            fi
-
-            if [ $BACKUP_RESULT -ne 0 ]; then
-                echo "Full backup failed!"
-                exit 1
-            fi
-
-            if [ "$OPT_NO_SYNC" -eq 1 ] || [ "$OPT_LOCAL_ONLY" -eq 1 ]; then
-                echo "`date '+%F %T'`: Full backup completed (local only, S3 sync skipped)"
-            else
-                LOCAL_BACKUP_NAME=`basename "$LOCAL_BACKUP_DIR"`
-                mc mirror --retry --overwrite "$LOCAL_BACKUP_DIR" "$CFG_MC_BUCKET_PATH/$LOCAL_BACKUP_NAME"
-                echo "`date '+%F %T'`: Full backup completed and mirrored to S3"
-            fi
-        fi
-    fi
-
-    if [ "$OPT_CLEANUP" -eq 1 ]; then
-        if [ "$OPT_LOCAL_ONLY" -eq 1 ]; then
-            echo "Local-only mode: skipping S3 cleanup"
-        else
-            cleanup_old_backups
-        fi
-    fi
-
-elif [ "$OPT_BACKUP_TYPE" = "restore" ]; then
-    FULL_BACKUP=`echo $BACKUP_ARGUMENTS | awk '{print $1}'`
-    if [ -z "$FULL_BACKUP" ]; then
-        echo "ERROR: No full backup specified for restore."
-        exit 1
-    fi
-
-    detect_backup_tool
-
-    # Check if backup exists locally first
-    if [ -d "$CFG_LOCAL_BACKUP_DIR/$FULL_BACKUP" ]; then
-        BACKUP_SOURCE="$CFG_LOCAL_BACKUP_DIR/$FULL_BACKUP"
-        BACKUP_LOCATION="local"
-        echo "Using local backup: $BACKUP_SOURCE"
-    else
-        BACKUP_SOURCE="${CFG_MC_BUCKET_PATH}/${FULL_BACKUP}"
-        BACKUP_LOCATION="s3"
-        echo "Using S3 backup: $BACKUP_SOURCE"
-    fi
-
-    if [ "$OPT_DRY_RUN" -eq 1 ]; then
-        echo "# Dry run: showing what would be executed"
-        echo "systemctl stop mysql"
-        echo "rm -rf /var/lib/mysql/*"
-        if [ "$BACKUP_LOCATION" = "local" ]; then
-            echo "cp -r \"$BACKUP_SOURCE\"/* /var/lib/mysql/"
-        else
-            echo "mc mirror --overwrite --remove \"$BACKUP_SOURCE\" /var/lib/mysql"
-        fi
-        echo "$BACKUP_CMD --prepare --target-dir=/var/lib/mysql"
-        echo "systemctl start mysql"
-        exit 0
-    fi
-
-    echo "Stopping MySQL..."
-    systemctl stop mysql
-    echo "Clearing /var/lib/mysql..."
-    rm -rf /var/lib/mysql/*
-    mkdir -p /var/lib/mysql
-    chown mysql:mysql /var/lib/mysql
-    chmod 0750 /var/lib/mysql
-
-    echo "Restoring full backup from $BACKUP_LOCATION: $FULL_BACKUP"
-    if [ "$BACKUP_LOCATION" = "local" ]; then
-        cp -r "$BACKUP_SOURCE"/* /var/lib/mysql/
-    else
-        mc mirror --overwrite --remove "$BACKUP_SOURCE" /var/lib/mysql
-    fi
-
-    echo "Preparing restored data..."
-    if [ "$BACKUP_TOOL" = "mariabackup" ]; then
-        TEMP_CNF=`mktemp`
-        echo "[mariabackup]" > "$TEMP_CNF"
-        echo "user=root" >> "$TEMP_CNF"
-        if grep -q "^password" /root/.my.cnf 2>/dev/null; then
-            grep "^password" /root/.my.cnf >> "$TEMP_CNF"
-        fi
-        
-        $BACKUP_CMD --defaults-file="$TEMP_CNF" --prepare --target-dir=/var/lib/mysql
-        rm -f "$TEMP_CNF"
-    else
-        $BACKUP_CMD --prepare --target-dir=/var/lib/mysql
-    fi
-
-    echo "Fixing permissions..."
-    chown -R mysql:mysql /var/lib/mysql
-
-    echo "Starting MySQL..."
-    systemctl start mysql
-
-    echo "✅ Full backup restored successfully from $BACKUP_LOCATION: $FULL_BACKUP"
-
-elif [ "$OPT_BACKUP_TYPE" = "sync" ]; then
-    BACKUP_FOLDER=`echo $BACKUP_ARGUMENTS | awk '{print $1}'`
-    if [ -z "$BACKUP_FOLDER" ]; then
-        echo "ERROR: No backup folder specified for sync."
-        exit 1
-    fi
-
-    if [ -d "$BACKUP_FOLDER" ]; then
-        LOCAL_BACKUP_PATH="$BACKUP_FOLDER"
-    elif [ -d "$CFG_LOCAL_BACKUP_DIR/$BACKUP_FOLDER" ]; then
-        LOCAL_BACKUP_PATH="$CFG_LOCAL_BACKUP_DIR/$BACKUP_FOLDER"
-    else
-        echo "ERROR: Backup folder not found: $BACKUP_FOLDER"
-        exit 1
-    fi
-
-    BACKUP_NAME=`basename "$LOCAL_BACKUP_PATH"`
-    
-    if [ "$OPT_DRY_RUN" -eq 1 ]; then
-        echo "# Dry run: would sync $BACKUP_NAME to S3"
-        exit 0
-    fi
-
-    echo "Syncing backup to S3: $BACKUP_NAME"
-    mc mirror --retry --overwrite "$LOCAL_BACKUP_PATH" "$CFG_MC_BUCKET_PATH/$BACKUP_NAME"
-    
-    if [ $? -eq 0 ]; then
-        echo "✅ Backup synced successfully to S3: $BACKUP_NAME"
-    else
-        echo "❌ Sync failed!"
-        exit 1
-    fi
-
-elif [ "$OPT_BACKUP_TYPE" = "sync-all" ]; then
-    if [ ! -d "$CFG_LOCAL_BACKUP_DIR" ]; then
-        echo "ERROR: Local backup directory does not exist: $CFG_LOCAL_BACKUP_DIR"
-        exit 1
-    fi
-
-    BACKUP_DIRS=`find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "20*" | sort`
-    
-    if [ -z "$BACKUP_DIRS" ]; then
-        echo "No backup directories found in $CFG_LOCAL_BACKUP_DIR"
-        exit 0
-    fi
-
-    if [ "$OPT_DRY_RUN" -eq 1 ]; then
-        echo "# Dry run: would sync all backups to S3"
-        echo "$BACKUP_DIRS" | while read backup_dir; do
-            if [ -d "$backup_dir" ]; then
-                backup_name=`basename "$backup_dir"`
-                echo "  Would sync: $backup_name"
-            fi
-        done
-        exit 0
-    fi
-
-    echo "Syncing all local backups to S3..."
-    echo "$BACKUP_DIRS" | while read backup_dir; do
-        if [ -d "$backup_dir" ]; then
-            backup_name=`basename "$backup_dir"`
-            echo "Syncing: $backup_name"
-            mc mirror --retry --overwrite "$backup_dir" "$CFG_MC_BUCKET_PATH/$backup_name"
-        fi
-    done
-    echo "✅ All backups synced successfully!"
-
-elif [ "$OPT_BACKUP_TYPE" = "delete-chain" ]; then
-    FULL_BACKUP=`echo $BACKUP_ARGUMENTS | awk '{print $1}'`
-    if [ -z "$FULL_BACKUP" ]; then
-        echo "ERROR: No full backup specified for chain deletion."
-        exit 1
-    fi
-
-    FULL_TIMESTAMP=`echo "$FULL_BACKUP" | grep -o '[0-9]*$'`
-    if [ -z "$FULL_TIMESTAMP" ]; then
-        echo "ERROR: Could not extract timestamp from backup name: $FULL_BACKUP"
-        exit 1
-    fi
-
-    if [ "$OPT_DRY_RUN" -eq 1 ]; then
-        echo "# Dry run: would delete incrementals for $FULL_BACKUP"
-        mc ls "$CFG_MC_BUCKET_PATH" 2>/dev/null | awk '{print $NF}' | grep "_inc_base-${FULL_TIMESTAMP}_" | while read inc_folder; do
-            inc_folder=`echo "$inc_folder" | sed 's/\/$//'`
-            if [ -n "$inc_folder" ]; then
-                echo "  Would delete: $inc_folder"
-            fi
-        done
-        exit 0
-    fi
-
-    echo "Deleting incremental backups for: $FULL_BACKUP"
-    mc ls "$CFG_MC_BUCKET_PATH" 2>/dev/null | awk '{print $NF}' | grep "_inc_base-${FULL_TIMESTAMP}_" | while read inc_folder; do
-        inc_folder=`echo "$inc_folder" | sed 's/\/$//'`
-        if [ -n "$inc_folder" ]; then
-            echo "Deleting: $inc_folder"
-            mc rb --force "$CFG_MC_BUCKET_PATH/$inc_folder"
-        fi
-    done
-    echo "✅ Incremental chain deletion completed"
-
-elif [ "$OPT_BACKUP_TYPE" = "analyze-chains" ]; then
-    analyze_backup_chains
-
-elif [ "$OPT_BACKUP_TYPE" = "list" ]; then
-    list_backups
-
-else
-    echo "Universal MySQL/MariaDB XtraBackup S3 Management Script"
-    echo ""
-    echo "Usage: $0 {full|inc|list|restore|sync|sync-all|delete-chain|analyze-chains} [OPTIONS]"
-    echo ""
-    echo "COMMANDS:"
-    echo "  full                    Create full backup"
-    echo "  inc                     Create incremental backup"  
-    echo "  list                    List all backups (local and S3)"
-    echo "  restore <backup>        Restore from full backup"
-    echo "  sync <backup-folder>    Sync specific backup to S3"
-    echo "  sync-all               Sync all local backups to S3"
-    echo "  delete-chain <backup>   Delete all incrementals for a full backup"
-    echo "  analyze-chains         Analyze backup chains and find orphans"
-    echo ""
-    echo "OPTIONS:"
-    echo "  --dry-run              Show what would be done without executing"
-    echo "  --cleanup              Remove old backups (for full/inc commands)"
-    echo "  --no-sync              Skip S3 sync, local backup only"
-    echo "  --local-only           Skip all S3 operations completely"
-    echo "  --restore-dir=<path>   Custom restore directory (default: /tmp/restore)"
-    echo ""
-    echo "EXAMPLES:"
-    echo "  $0 full --cleanup --local-only                      # Full backup with local cleanup only"
-    echo "  $0 inc --local-only                                 # Incremental backup, no S3 at all"
-    echo "  $0 list --local-only                               # Show only local backups"
-    echo "  $0 restore 2025-07-18_08-57-49_full_1750928269     # Restore full backup"
-    echo "  $0 sync 2025-07-18_12-00-00_inc_base-1750928269_1750939200 # Sync specific backup"
-    echo "  $0 sync-all --dry-run                               # Preview sync all"
-    echo "  $0 delete-chain 2025-07-18_08-57-49_full_1750928269 --dry-run # Preview delete"
-    echo "  $0 analyze-chains                                   # Analyze backup chains"
-    echo ""
-    echo "DATABASE COMPATIBILITY:"
-    echo "  MySQL/Percona Server (uses xtrabackup)"
-    echo "  MariaDB (uses mariabackup)"
-    echo "  MariaDB Galera Cluster (uses mariabackup --galera-info)"
-    echo ""
-    echo "The script automatically detects your database type and uses the appropriate backup tool."
+  elif command -v xtrabackup >/dev/null 2>&1; then
+    BACKUP_TOOL=xtrabackup BACKUP_CMD=xtrabackup
+  else
+    echo "ERROR: install xtrabackup or mariabackup." >&2
     exit 1
-fi
+  fi
+}
+
+##############################################################################
+cleanup_old_backups() {
+  echo "Pruning old chains in S3 …"
+  CUTOFF_DATE=$(date -d "$CFG_CUTOFF_DAYS days ago" +%Y-%m-%d)
+  CUTOFF_NUM=$(echo "$CUTOFF_DATE" | tr -d '-')
+
+  TMP=$(mktemp)
+  mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | sed 's:/$::' | sort >"$TMP"
+
+  grep "_full_" "$TMP" | while read -r FULL; do
+    [ -z "$FULL" ] && continue
+    FULL_DATE=$(echo "$FULL" | cut -d_ -f1)
+    FULL_NUM=$(echo "$FULL_DATE" | tr -d '-')
+    FULL_TS=$(echo "$FULL" | grep -o '[0-9]*$')
+
+    if [ "$FULL_NUM" -lt "$CUTOFF_NUM" ]; then
+      echo "  Removing chain rooted at $FULL"
+      grep "_inc_base-${FULL_TS}_" "$TMP" |
+      while read -r INC; do
+        [ -z "$INC" ] && continue
+        if [ "$OPT_DRY_RUN" -eq 1 ]; then
+          echo "    [DRY-RUN] mc rb --force \"$CFG_MC_BUCKET_PATH/$INC\""
+        else
+          mc rb --force "$CFG_MC_BUCKET_PATH/$INC"
+        fi
+      done
+      if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        echo "    [DRY-RUN] mc rb --force \"$CFG_MC_BUCKET_PATH/$FULL\""
+      else
+        mc rb --force "$CFG_MC_BUCKET_PATH/$FULL"
+      fi
+    fi
+  done
+  rm -f "$TMP"
+}
+
+##############################################################################
+analyze_backup_chains() {
+  echo "=== BACKUP CHAIN ANALYSIS ==="
+  TMP=$(mktemp)
+  mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | sed 's:/$::' | sort >"$TMP"
+
+  grep "_full_" "$TMP" | while read -r FULL; do
+    [ -z "$FULL" ] && continue
+    TS=$(echo "$FULL" | grep -o '[0-9]*$')
+    INC_COUNT=$(grep -c "_inc_base-${TS}_" "$TMP")
+    if [ "$INC_COUNT" -gt 0 ]; then
+      echo "📁 $FULL  ↳ $INC_COUNT incrementals"
+    else
+      echo "📁 $FULL  [stand-alone]"
+    fi
+  done
+  rm -f "$TMP"
+  echo "=== END ANALYSIS ==="
+}
+
+##############################################################################
+list_backups() {
+  echo "=== LOCAL BACKUPS ==="
+  if [ -d "$CFG_LOCAL_BACKUP_DIR" ]; then
+    find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name '20*' | sort -r |
+    while read -r D; do
+      echo "  $(basename "$D") ($(du -sh "$D" | cut -f1))"
+    done
+  else
+    echo "  [none]"
+  fi
+  echo
+  echo "=== REMOTE BACKUPS ==="
+  if mc ls "$CFG_MC_BUCKET_PATH" >/dev/null 2>&1; then
+    mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | sort -r |
+    while read -r F; do
+      F=$(echo "$F" | sed 's:/$::')
+      SIZE=$(mc du "$CFG_MC_BUCKET_PATH/$F" | awk '{print $1}')
+      echo "  $F ($SIZE)"
+    done
+  else
+    echo "  [cannot access bucket]"
+  fi
+}
+
+##############################################################################
+prepare_backup() {
+  BACKUP_DIR=$1
+  # shellcheck disable=SC2034
+  IS_FULL=${2:-1}
+
+  DECRYPT_OPTIONS=""
+  ENCRYPT_KEY=""
+
+  # decrypt
+  if find "$BACKUP_DIR" -name '*.xbcrypt' | grep -q .; then
+    if [ -f /root/.my.cnf ]; then
+      ENCRYPT_KEY=$(grep -A10 '^\[xtrabackup\]' /root/.my.cnf |
+        grep '^encrypt-key' | cut -d= -f2 | tr -d ' ')
+    fi
+    [ -z "$ENCRYPT_KEY" ] && [ -n "$CFG_ENCRYPT_KEY" ] && ENCRYPT_KEY=$CFG_ENCRYPT_KEY
+    if [ -n "$ENCRYPT_KEY" ]; then
+      DECRYPT_OPTIONS="--encrypt-key=$ENCRYPT_KEY"
+    elif [ -n "$CFG_ENCRYPT_KEY_FILE" ]; then
+      DECRYPT_OPTIONS="--encrypt-key-file=$CFG_ENCRYPT_KEY_FILE"
+    else
+      echo "ERROR: encrypted backup but no key." >&2
+      return 1
+    fi
+
+    if [ "$BACKUP_TOOL" != "mariabackup" ]; then
+      $BACKUP_CMD --decrypt=AES256 "$DECRYPT_OPTIONS" --target-dir="$BACKUP_DIR"
+    fi
+  fi
+
+  # decompress
+  if find "$BACKUP_DIR" \( -name '*.zst' -o -name '*.qp' \) | grep -q .; then
+    if [ "$BACKUP_TOOL" != "mariabackup" ]; then
+      $BACKUP_CMD --decompress --target-dir="$BACKUP_DIR"
+      find "$BACKUP_DIR" \( -name '*.zst' -o -name '*.qp' \) -exec rm -f {} +
+    fi
+  fi
+
+  # prepare
+  if [ "$BACKUP_TOOL" = "mariabackup" ]; then
+    TMP_CNF=$(mktemp)
+    {
+      echo "[mariabackup]"
+      echo "user=root"
+      grep '^password' /root/.my.cnf 2>/dev/null
+      [ -n "$ENCRYPT_KEY" ] && echo "encrypt-key=$ENCRYPT_KEY"
+    } >"$TMP_CNF"
+    $BACKUP_CMD --defaults-file="$TMP_CNF" --prepare --target-dir="$BACKUP_DIR"
+    rm -f "$TMP_CNF"
+  else
+    $BACKUP_CMD --defaults-file=/root/.my.cnf --prepare --target-dir="$BACKUP_DIR"
+  fi
+}
+
+##############################################################################
+# ---------------------------------------------------------------------------
+# MAIN DISPATCH
+# ---------------------------------------------------------------------------
+case "$OPT_BACKUP_TYPE" in
+##############################################################################
+full|inc)
+  detect_backup_tool
+  mkdir -p "$CFG_LOCAL_BACKUP_DIR"
+
+  ########################################################################
+  # ---------------------- Incremental backup ---------------------------
+  ########################################################################
+  if [ "$OPT_BACKUP_TYPE" = "inc" ]; then
+    LATEST=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name '20*' |
+             sort -r | head -n1)
+    [ -n "$LATEST" ] || { echo "No base backup. Run full first." >&2; exit 1; }
+
+    LATEST_NAME=$(basename "$LATEST")
+    if echo "$LATEST_NAME" | grep -q '_full_'; then
+      BASE_TS=$(echo "$LATEST_NAME" | grep -o '[0-9]*$')
+    else
+      BASE_TS=$(echo "$LATEST_NAME" | sed 's/.*_inc_base-\([0-9]*\)_.*/\1/')
+    fi
+
+    LOCAL_DIR="$CFG_LOCAL_BACKUP_DIR/${CFG_DATE}_inc_base-${BASE_TS}_${CFG_TIMESTAMP}"
+    INC_OPT="--incremental-basedir=$LATEST"
+
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+      echo "# DRY-RUN incremental backup"
+      echo "mkdir -p \"$LOCAL_DIR\""
+      if [ "$BACKUP_TOOL" = "mariabackup" ]; then
+        echo "mariabackup --backup $INC_OPT $GALERA_OPTIONS --target-dir=\"$LOCAL_DIR\" \\"
+        echo "            --defaults-file=/root/.my.cnf"
+      else
+        echo "xtrabackup --backup $INC_OPT $GALERA_OPTIONS --extra-lsndir=\"$LOCAL_DIR\" \\"
+        echo "           --target-dir=\"$LOCAL_DIR\""
+      fi
+      if [ "$OPT_NO_SYNC" -eq 0 ] && [ "$OPT_LOCAL_ONLY" -eq 0 ]; then
+        echo "mc mirror --retry --overwrite \"$LOCAL_DIR\" \\"
+        echo "          \"$CFG_MC_BUCKET_PATH/$(basename "$LOCAL_DIR")\""
+      fi
+      exit 0
+    fi
+
+    mkdir -p "$LOCAL_DIR"
+    if [ "$BACKUP_TOOL" = "mariabackup" ]; then
+      TMP_CNF=$(mktemp)
+      {
+        echo "[mariabackup]"
+        echo "user=root"
+        grep '^password' /root/.my.cnf 2>/dev/null
+      } >"$TMP_CNF"
+      $BACKUP_CMD --defaults-file="$TMP_CNF" --backup "$INC_OPT" \
+                  $GALERA_OPTIONS --target-dir="$LOCAL_DIR"
+      rm -f "$TMP_CNF"
+    else
+      $BACKUP_CMD --backup "$INC_OPT" $GALERA_OPTIONS \
+                  --extra-lsndir="$LOCAL_DIR" --target-dir="$LOCAL_DIR"
+    fi
+
+    if [ "$OPT_NO_SYNC" -eq 0 ] && [ "$OPT_LOCAL_ONLY" -eq 0 ]; then
+      mc mirror --retry --overwrite "$LOCAL_DIR" \
+                "$CFG_MC_BUCKET_PATH/$(basename "$LOCAL_DIR")"
+    fi
+
+  ########################################################################
+  # ------------------------- Full backup -------------------------------
+  ########################################################################
+  else
+    LOCAL_DIR="$CFG_LOCAL_BACKUP_DIR/${CFG_DATE}_full_${CFG_TIMESTAMP}"
+
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+      echo "# DRY-RUN full backup"
+      echo "mkdir -p \"$LOCAL_DIR\""
+      if [ "$BACKUP_TOOL" = "mariabackup" ]; then
+        echo "mariabackup --backup $GALERA_OPTIONS --target-dir=\"$LOCAL_DIR\" \\"
+        echo "            --defaults-file=/root/.my.cnf"
+      else
+        echo "xtrabackup --backup $GALERA_OPTIONS --extra-lsndir=\"$LOCAL_DIR\" \\"
+        echo "           --target-dir=\"$LOCAL_DIR\""
+      fi
+      if [ "$OPT_NO_SYNC" -eq 0 ] && [ "$OPT_LOCAL_ONLY" -eq 0 ]; then
+        echo "mc mirror --retry --overwrite \"$LOCAL_DIR\" \\"
+        echo "          \"$CFG_MC_BUCKET_PATH/$(basename "$LOCAL_DIR")\""
+      fi
+      if [ "$OPT_CLEANUP" -eq 1 ] && [ "$OPT_LOCAL_ONLY" -eq 0 ]; then
+        echo "# would also prune old chains in S3 (cleanup_old_backups)"
+      fi
+      exit 0
+    fi
+
+    mkdir -p "$LOCAL_DIR"
+
+    KEEP=${CFG_LOCAL_BACKUP_KEEP_COUNT:-4}
+    COUNT=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name '20*' | wc -l)
+    if [ "$COUNT" -gt "$KEEP" ]; then
+      find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name '20*' | sort |
+      head -n $(( COUNT - KEEP )) | while read -r OLD; do rm -rf "$OLD"; done
+    fi
+
+    if [ "$BACKUP_TOOL" = "mariabackup" ]; then
+      TMP_CNF=$(mktemp)
+      {
+        echo "[mariabackup]"
+        echo "user=root"
+        grep '^password' /root/.my.cnf 2>/dev/null
+      } >"$TMP_CNF"
+      $BACKUP_CMD --defaults-file="$TMP_CNF" --backup $GALERA_OPTIONS \
+                  --target-dir="$LOCAL_DIR"
+      rm -f "$TMP_CNF"
+    else
+      $BACKUP_CMD --backup $GALERA_OPTIONS \
+                  --extra-lsndir="$LOCAL_DIR" --target-dir="$LOCAL_DIR"
+    fi
+
+    if [ "$OPT_NO_SYNC" -eq 0 ] && [ "$OPT_LOCAL_ONLY" -eq 0 ]; then
+      mc mirror --retry --overwrite "$LOCAL_DIR" \
+                "$CFG_MC_BUCKET_PATH/$(basename "$LOCAL_DIR")"
+    fi
+  fi
+
+  [ "$OPT_CLEANUP" -eq 1 ] && [ "$OPT_LOCAL_ONLY" -eq 0 ] && cleanup_old_backups
+  ;;
+
+##############################################################################
+restore)
+  FULL_BACKUP=$(echo "$BACKUP_ARGUMENTS" | awk '{print $1}')
+  [ -n "$FULL_BACKUP" ] || { echo "Need backup name." >&2; exit 1; }
+  detect_backup_tool
+
+  RESTORE_DIR=${OPT_RESTORE_DIR:-/var/tmp/restore_$$}
+
+  if [ -d "$CFG_LOCAL_BACKUP_DIR/$FULL_BACKUP" ]; then
+    SRC="$CFG_LOCAL_BACKUP_DIR/$FULL_BACKUP"; SRC_TYPE=local
+  else
+    SRC="$CFG_MC_BUCKET_PATH/$FULL_BACKUP"; SRC_TYPE=s3
+  fi
+
+  if [ "$OPT_DRY_RUN" -eq 1 ]; then
+    echo "# DRY-RUN: full restore procedure"
+    echo "mkdir -p \"$RESTORE_DIR\""
+    if [ "$SRC_TYPE" = local ]; then
+      echo "cp -r \"$SRC\"/. \"$RESTORE_DIR\""
+    else
+      echo "mc mirror --overwrite --remove \"$SRC\" \"$RESTORE_DIR\""
+    fi
+    echo "# decrypt (if *.xbcrypt present)"
+    echo "$BACKUP_CMD --decrypt=AES256 <key-opts> --target-dir=\"$RESTORE_DIR\"    # auto-skipped if not encrypted"
+    echo "# decompress (if *.zst / *.qp present)"
+    echo "$BACKUP_CMD --decompress --target-dir=\"$RESTORE_DIR\"                   # auto-skipped if not compressed"
+    echo "# prepare backup"
+    echo "$BACKUP_CMD --prepare --target-dir=\"$RESTORE_DIR\""
+    echo "systemctl stop mysql"
+    echo "rm -rf /var/lib/mysql/*"
+    echo "$BACKUP_CMD --copy-back --target-dir=\"$RESTORE_DIR\""
+    echo "chown -R mysql:mysql /var/lib/mysql"
+    echo "systemctl start mysql"
+    echo "rm -rf \"$RESTORE_DIR\""
+    exit 0
+  fi
+
+  mkdir -p "$RESTORE_DIR"
+  if [ "$SRC_TYPE" = local ]; then
+    cp -r "$SRC"/. "$RESTORE_DIR"
+  else
+    mc mirror --overwrite --remove "$SRC" "$RESTORE_DIR"
+  fi
+
+  prepare_backup "$RESTORE_DIR" 1
+
+  systemctl stop mysql
+  rm -rf /var/lib/mysql/* && mkdir -p /var/lib/mysql &&
+    chown mysql:mysql /var/lib/mysql && chmod 0750 /var/lib/mysql
+
+  if [ "$BACKUP_TOOL" = "mariabackup" ]; then
+    TMP_CNF=$(mktemp)
+    {
+      echo "[mariabackup]"
+      echo "user=root"
+      grep '^password' /root/.my.cnf 2>/dev/null
+    } >"$TMP_CNF"
+    $BACKUP_CMD --defaults-file="$TMP_CNF" --copy-back --target-dir="$RESTORE_DIR"
+    rm -f "$TMP_CNF"
+  else
+    $BACKUP_CMD --copy-back --target-dir="$RESTORE_DIR"
+  fi
+
+  chown -R mysql:mysql /var/lib/mysql
+  rm -rf "$RESTORE_DIR"
+
+  systemctl start mysql
+  sleep 2
+  if systemctl is-active mysql >/dev/null 2>&1; then
+    echo "✅ Restore complete."
+  else
+    echo "❌ MySQL failed. Check logs." >&2
+    exit 1
+  fi
+  ;;
+
+##############################################################################
+sync)
+  FOLDER=$(echo "$BACKUP_ARGUMENTS" | awk '{print $1}')
+  [ -n "$FOLDER" ] || { echo "Need folder to sync." >&2; exit 1; }
+
+  if [ -d "$FOLDER" ]; then
+    LOCAL="$FOLDER"
+  elif [ -d "$CFG_LOCAL_BACKUP_DIR/$FOLDER" ]; then
+    LOCAL="$CFG_LOCAL_BACKUP_DIR/$FOLDER"
+  else
+    echo "Folder not found: $FOLDER" >&2; exit 1
+  fi
+
+  if [ "$OPT_DRY_RUN" -eq 1 ]; then
+    echo "# DRY-RUN sync"
+    echo "mc mirror --retry --overwrite \"$LOCAL\" \\"
+    echo "          \"$CFG_MC_BUCKET_PATH/$(basename "$LOCAL")\""
+    exit 0
+  fi
+
+  mc mirror --retry --overwrite "$LOCAL" \
+            "$CFG_MC_BUCKET_PATH/$(basename "$LOCAL")"
+  ;;
+
+##############################################################################
+sync-all)
+  [ -d "$CFG_LOCAL_BACKUP_DIR" ] || { echo "No local backups." >&2; exit 0; }
+
+  if [ "$OPT_DRY_RUN" -eq 1 ]; then
+    echo "# DRY-RUN sync-all"
+    find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name '20*' | sort |
+    while read -r D; do
+      echo "mc mirror --retry --overwrite \"$D\" \\"
+      echo "          \"$CFG_MC_BUCKET_PATH/$(basename "$D")\""
+    done
+    exit 0
+  fi
+
+  find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name '20*' | sort |
+  while read -r D; do
+    mc mirror --retry --overwrite "$D" \
+      "$CFG_MC_BUCKET_PATH/$(basename "$D")"
+  done
+  ;;
+
+##############################################################################
+delete-chain)
+  FULL_BACKUP=$(echo "$BACKUP_ARGUMENTS" | awk '{print $1}')
+  [ -n "$FULL_BACKUP" ] || { echo "Need full backup name." >&2; exit 1; }
+
+  TS=$(echo "$FULL_BACKUP" | grep -o '[0-9]*$')
+  [ -n "$TS" ] || { echo "Timestamp missing in name." >&2; exit 1; }
+
+  if [ "$OPT_DRY_RUN" -eq 1 ]; then
+    echo "# DRY-RUN delete-chain for $FULL_BACKUP"
+    mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' |
+      grep "_inc_base-${TS}_" | sed 's:/$::' |
+      while read -r INC; do
+        echo "mc rb --force \"$CFG_MC_BUCKET_PATH/$INC\""
+      done
+    exit 0
+  fi
+
+  mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' |
+  grep "_inc_base-${TS}_" | sed 's:/$::' |
+  while read -r INC; do
+    mc rb --force "$CFG_MC_BUCKET_PATH/$INC"
+  done
+  ;;
+
+##############################################################################
+analyze-chains) analyze_backup_chains ;;
+list)           list_backups ;;
+*)
+  cat <<'EOF'
+Usage: script.sh {full|inc|list|restore|sync|sync-all|delete-chain|analyze-chains} [OPTIONS]
+
+  full                Create a full backup
+  inc                 Create an incremental backup
+  list                List local & S3 backups
+  restore <backup>    Restore a full backup
+  sync <folder>       Sync one local backup folder to S3
+  sync-all            Sync every local backup to S3
+  delete-chain <full> Delete every incremental for <full>
+  analyze-chains      Show backup chains / orphans
+
+Common options
+  --dry-run           Print every command, do nothing
+  --cleanup           After backup, prune old chains in S3
+  --no-sync           Skip S3 mirror step
+  --local-only        Ignore S3 entirely (skip mirror / cleanup)
+  --restore-dir=<p>   Custom restore dir (default /var/tmp/restore_PID)
+EOF
+  exit 1
+  ;;
+esac
 
 exit 0
