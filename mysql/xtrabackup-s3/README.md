@@ -1,6 +1,13 @@
-# Universal MySQL/MariaDB XtraBackup S3 Management Script
+# Universal MySQL/MariaDB XtraBackup S3 Management Scripts
 
-A comprehensive shell script for managing MySQL and MariaDB backups with automatic tool detection. Supports both Percona XtraBackup (MySQL/Percona) and MariaBackup (MariaDB/Galera) with S3 storage integration, full and incremental backups, encryption, compression, and intelligent backup chain management.
+A pair of comprehensive POSIX-compliant shell scripts for managing MySQL and MariaDB backups with automatic tool detection. Supports both Percona XtraBackup (MySQL/Percona) and MariaBackup (MariaDB/Galera) with S3 storage integration, full and incremental backups, encryption, compression, and intelligent backup chain management.
+
+## Architecture
+
+The system consists of two specialized scripts:
+
+- **`xtrabackup-s3.sh`** - Handles all backup operations (full, incremental, sync, management)
+- **`xtrabackup-s3-restore.sh`** - Handles restore operations with automatic decompression/decryption
 
 ## Features
 
@@ -12,9 +19,10 @@ A comprehensive shell script for managing MySQL and MariaDB backups with automat
 - **🔗 Backup Chain Tracking**: Smart naming convention to track incremental relationships
 - **🏠 Local-Only Mode**: Complete offline backup support with `--local-only`
 - **🔄 Flexible Sync Options**: Local-only, S3-only, or combined backup strategies
-- **🛠️ Comprehensive Management**: List, sync, delete, and restore backup chains
+- **🛠️ Comprehensive Management**: List, sync, delete, and analyze backup chains
 - **👀 Dry-Run Support**: Preview all operations before execution
 - **📊 Chain Analysis**: Analyze backup chains and find orphaned backups
+- **🔧 Automatic Restore Handling**: Decryption, decompression, and preparation in one step
 
 ## Database Compatibility
 
@@ -25,7 +33,7 @@ A comprehensive shell script for managing MySQL and MariaDB backups with automat
 | **MariaDB 10.x** | `mariabackup` | ❌ Standalone | ✅ Fully Supported |
 | **MariaDB Galera Cluster** | `mariabackup --galera-info` | ✅ Cluster-aware | ✅ Fully Supported |
 
-The script automatically detects your database type and uses the appropriate backup tool.
+The scripts automatically detect your database type and use the appropriate backup tool.
 
 ## Requirements
 
@@ -43,6 +51,7 @@ Choose based on your database:
 - **MinIO Client (mc)** - configured with S3 credentials (optional with `--local-only`)
 - **zstd** - for compression (optional)
 - **Shell access** with appropriate permissions
+- **Sufficient space in `/var/tmp`** for restore operations
 
 ## Installation
 
@@ -73,6 +82,22 @@ sudo apt install zstd mc
 
 # RHEL/CentOS
 sudo yum install zstd mc
+```
+
+### Install Scripts
+
+```bash
+# Download both scripts
+wget https://example.com/xtrabackup-s3.sh
+wget https://example.com/xtrabackup-s3-restore.sh
+
+# Make executable and move to PATH
+chmod +x xtrabackup-s3*.sh
+sudo mv xtrabackup-s3*.sh /usr/local/bin/
+
+# Verify installation
+xtrabackup-s3.sh --help
+xtrabackup-s3-restore.sh --help
 ```
 
 ## Configuration
@@ -133,96 +158,108 @@ mc ls your-alias/mysql-backups/
 
 ## Usage
 
-### Basic Commands
+### Backup Operations (`xtrabackup-s3.sh`)
+
+#### Basic Commands
 
 ```bash
 # Show help and database compatibility info
-./xtrabackup-s3.sh
+xtrabackup-s3.sh
 
 # Create full backup (auto-detects database type)
-./xtrabackup-s3.sh full
+xtrabackup-s3.sh full
 
 # Create incremental backup
-./xtrabackup-s3.sh inc
+xtrabackup-s3.sh inc
 
 # List all backups (shows backup chains)
-./xtrabackup-s3.sh list
+xtrabackup-s3.sh list
 ```
 
-### Local-Only Mode
+#### Local-Only Mode
 
 Perfect for environments without S3 access or purely local backup strategies:
 
 ```bash
 # Full backup with local cleanup only (no S3 operations)
-./xtrabackup-s3.sh full --cleanup --local-only
+xtrabackup-s3.sh full --cleanup --local-only
 
 # Incremental backup, completely local
-./xtrabackup-s3.sh inc --local-only
+xtrabackup-s3.sh inc --local-only
 
 # List only local backups (skip S3 access)
-./xtrabackup-s3.sh list --local-only
+xtrabackup-s3.sh list --local-only
 
 # Preview local-only operations
-./xtrabackup-s3.sh full --local-only --dry-run
+xtrabackup-s3.sh full --local-only --dry-run
 ```
 
-### Available Commands
+#### Available Commands
 
 | Command | Description | S3 Required |
 |---------|-------------|-------------|
 | `full` | Create full backup | Optional |
 | `inc` | Create incremental backup | Optional |
 | `list` | List all backups | Optional |
-| `restore <backup>` | Restore from full backup | **No** (prefers local) |
 | `sync <folder>` | Sync specific backup to S3 | Yes |
 | `sync-all` | Sync all local backups to S3 | Yes |
 | `delete-chain <backup>` | Delete incrementals for a full backup | Yes |
 | `analyze-chains` | Analyze backup chains and find orphans | Yes |
 
-### Backup Options
+#### Backup Options
 
 ```bash
 # Full backup with cleanup of old backups
-./xtrabackup-s3.sh full --cleanup
+xtrabackup-s3.sh full --cleanup
 
 # Skip S3 sync but keep S3 cleanup functionality  
-./xtrabackup-s3.sh inc --no-sync
+xtrabackup-s3.sh inc --no-sync
 
 # Completely disable all S3 operations
-./xtrabackup-s3.sh inc --local-only
+xtrabackup-s3.sh inc --local-only
 
 # Preview what would happen (dry run)
-./xtrabackup-s3.sh full --cleanup --dry-run
+xtrabackup-s3.sh full --cleanup --dry-run
 ```
 
-## Restore Operations
+### Restore Operations (`xtrabackup-s3-restore.sh`)
 
-### Smart Restore Logic
+The restore script handles all complexities of restoration including:
+- Automatic detection of encryption/compression
+- Decryption using keys from `.my.cnf`
+- Decompression of zstd/qpress files
+- Proper preparation of backup
+- Safe restoration to MySQL data directory
 
-The `restore` command intelligently chooses between local and S3 backups:
+#### Smart Restore Logic
+
+The restore script intelligently chooses between local and S3 backups:
 
 1. **Checks local backups first** - if backup exists locally, uses it directly
 2. **Falls back to S3** - if not found locally, downloads from S3
 3. **Automatic detection** - no need to specify source location
+4. **Uses `/var/tmp` by default** - for sufficient space during decompression
 
 ```bash
 # Restore from local backup (if available) or S3
-./xtrabackup-s3.sh restore 2025-07-18_08-57-49_full_1750928269
+xtrabackup-s3-restore.sh restore 2025-07-18_08-57-49_full_1750928269
 
 # Preview restore operation
-./xtrabackup-s3.sh restore 2025-07-18_08-57-49_full_1750928269 --dry-run
+xtrabackup-s3-restore.sh restore 2025-07-18_08-57-49_full_1750928269 --dry-run
+
+# Use custom restore directory for decompression
+xtrabackup-s3-restore.sh restore 2025-07-18_08-57-49_full_1750928269 --restore-dir=/mnt/large-disk/restore
 ```
 
-### Restore Examples
+#### Restore Examples
 
 **Local-Only Environment:**
 ```bash
 # List local backups
-./xtrabackup-s3.sh list --local-only
+xtrabackup-s3.sh list --local-only
 
 # Restore from local backup (no S3 required)
-./xtrabackup-s3.sh restore 2025-07-18_08-57-49_full_1750928269
+xtrabackup-s3-restore.sh restore 2025-07-18_08-57-49_full_1750928269
 
 # Output: "Using local backup: /mnt/backup/2025-07-18_08-57-49_full_1750928269"
 ```
@@ -230,17 +267,36 @@ The `restore` command intelligently chooses between local and S3 backups:
 **S3-Integrated Environment:**
 ```bash
 # List all backups
-./xtrabackup-s3.sh list
+xtrabackup-s3.sh list
 
 # Restore - will use local if available, otherwise S3
-./xtrabackup-s3.sh restore 2025-07-18_08-57-49_full_1750928269
+xtrabackup-s3-restore.sh restore 2025-07-18_08-57-49_full_1750928269
 
 # Output: "Using S3 backup: s3://bucket/2025-07-18_08-57-49_full_1750928269"
 ```
 
+**Encrypted/Compressed Backups:**
+```bash
+# The restore script automatically handles:
+# 1. Detection of .xbcrypt encrypted files
+# 2. Reading encryption key from /root/.my.cnf
+# 3. Decryption with proper key
+# 4. Decompression of .zst files
+# 5. Preparation and restoration
+
+xtrabackup-s3-restore.sh restore 2025-07-18_08-57-49_full_1750928269
+# Output: 
+# "Backup is encrypted, checking for encryption key..."
+# "Using encryption key from .my.cnf"
+# "Decrypting backup..."
+# "Backup is compressed, decompressing..."
+# "Running prepare phase..."
+# "✅ Full backup restored successfully"
+```
+
 ## Backup Chain Structure
 
-The script uses an intelligent naming convention to track backup relationships:
+The scripts use an intelligent naming convention to track backup relationships:
 
 ```
 📁 2025-07-18_08-57-49_full_1750928269 (12G) [FULL]
@@ -263,40 +319,49 @@ The `base-TIMESTAMP` clearly shows which full backup each incremental belongs to
 
 ```bash
 # Local-only backups for fast recovery
-./xtrabackup-s3.sh full --cleanup --local-only
+xtrabackup-s3.sh full --cleanup --local-only
 
 # Incremental backups every few hours
-./xtrabackup-s3.sh inc --local-only
+xtrabackup-s3.sh inc --local-only
 
 # Analyze backup chains
-./xtrabackup-s3.sh analyze-chains
+xtrabackup-s3.sh analyze-chains
+
+# Restore when needed (automatic tool detection)
+xtrabackup-s3-restore.sh restore 2025-07-18_08-57-49_full_1750928269
 ```
 
 ### Mixed Environment Strategy
 
 ```bash
 # Development (local-only)
-./xtrabackup-s3.sh inc --local-only
+xtrabackup-s3.sh inc --local-only
 
 # Production (with S3 sync)
-./xtrabackup-s3.sh full --cleanup
+xtrabackup-s3.sh full --cleanup
 
 # Sync development backups to S3 when needed
-./xtrabackup-s3.sh sync-all --dry-run
-./xtrabackup-s3.sh sync-all
+xtrabackup-s3.sh sync-all --dry-run
+xtrabackup-s3.sh sync-all
+
+# Restore from any source
+xtrabackup-s3-restore.sh restore 2025-07-18_08-57-49_full_1750928269
 ```
 
 ### Traditional S3 Strategy
 
 ```bash
 # Sunday: Full backup with cleanup
-./xtrabackup-s3.sh full --cleanup
+xtrabackup-s3.sh full --cleanup
 
 # Monday-Saturday: Incremental backups
-./xtrabackup-s3.sh inc
+xtrabackup-s3.sh inc
 
 # Weekly: Analyze backup chains
-./xtrabackup-s3.sh analyze-chains
+xtrabackup-s3.sh analyze-chains
+
+# Restore with automatic S3 download if needed
+xtrabackup-s3-restore.sh restore 2025-07-19_08-57-49_full_1750928270
 ```
 
 ## Management Commands
@@ -305,7 +370,7 @@ The `base-TIMESTAMP` clearly shows which full backup each incremental belongs to
 
 ```bash
 # Analyze all backup chains
-./xtrabackup-s3.sh analyze-chains
+xtrabackup-s3.sh analyze-chains
 
 # Example output:
 # === BACKUP CHAIN ANALYSIS ===
@@ -320,23 +385,23 @@ The `base-TIMESTAMP` clearly shows which full backup each incremental belongs to
 
 ```bash
 # Delete all incrementals for a full backup (keeps full backup)
-./xtrabackup-s3.sh delete-chain 2025-07-18_08-57-49_full_1750928269 --dry-run
-./xtrabackup-s3.sh delete-chain 2025-07-18_08-57-49_full_1750928269
+xtrabackup-s3.sh delete-chain 2025-07-18_08-57-49_full_1750928269 --dry-run
+xtrabackup-s3.sh delete-chain 2025-07-18_08-57-49_full_1750928269
 
 # Sync specific backup to S3
-./xtrabackup-s3.sh sync 2025-07-18_12-00-00_inc_base-1750928269_1750939200
+xtrabackup-s3.sh sync 2025-07-18_12-00-00_inc_base-1750928269_1750939200
 
 # Sync all local backups to S3
-./xtrabackup-s3.sh sync-all --dry-run
-./xtrabackup-s3.sh sync-all
+xtrabackup-s3.sh sync-all --dry-run
+xtrabackup-s3.sh sync-all
 ```
 
 ## Tool Detection Output
 
-The script provides clear feedback about detected database type:
+Both scripts provide clear feedback about detected database type:
 
 ```bash
-$ ./xtrabackup-s3.sh full --local-only
+$ xtrabackup-s3.sh full --local-only
 
 Detecting database type and backup tool...
 MariaDB detected - using mariabackup
@@ -371,39 +436,39 @@ mysql-backups/hostname/
 **Mixed Environment:**
 ```bash
 # MariaDB Galera - local-only backups
-0 2 * * 0 /root/xtrabackup-s3.sh full --cleanup --local-only
-0 */6 * * 1-6 /root/xtrabackup-s3.sh inc --local-only
+0 2 * * 0 /usr/local/bin/xtrabackup-s3.sh full --cleanup --local-only
+0 */6 * * 1-6 /usr/local/bin/xtrabackup-s3.sh inc --local-only
 
 # MySQL Production - with S3 sync
-0 2 * * 0 /root/xtrabackup-s3.sh full --cleanup
-0 */6 * * 1-6 /root/xtrabackup-s3.sh inc
+0 2 * * 0 /usr/local/bin/xtrabackup-s3.sh full --cleanup
+0 */6 * * 1-6 /usr/local/bin/xtrabackup-s3.sh inc
 ```
 
 **Local-Only Strategy:**
 ```bash
 # Full backup Sundays with local cleanup
-0 2 * * 0 /root/xtrabackup-s3.sh full --cleanup --local-only
+0 2 * * 0 /usr/local/bin/xtrabackup-s3.sh full --cleanup --local-only
 
 # Incremental backups every 4 hours
-0 */4 * * * /root/xtrabackup-s3.sh inc --local-only
+0 */4 * * * /usr/local/bin/xtrabackup-s3.sh inc --local-only
 
 # Weekly chain analysis
-0 3 * * 0 /root/xtrabackup-s3.sh analyze-chains
+0 3 * * 0 /usr/local/bin/xtrabackup-s3.sh analyze-chains
 ```
 
 **S3-Integrated Strategy:**
 ```bash
 # Full backup with S3 sync and cleanup
-0 2 * * 0 /root/xtrabackup-s3.sh full --cleanup
+0 2 * * 0 /usr/local/bin/xtrabackup-s3.sh full --cleanup
 
 # Incremental backups with S3 sync
-0 */6 * * * /root/xtrabackup-s3.sh inc
+0 */6 * * * /usr/local/bin/xtrabackup-s3.sh inc
 
 # Daily: Sync any missed backups
-0 3 * * * /root/xtrabackup-s3.sh sync-all
+0 3 * * * /usr/local/bin/xtrabackup-s3.sh sync-all
 
 # Weekly: Analyze backup chains
-0 4 * * 0 /root/xtrabackup-s3.sh analyze-chains
+0 4 * * 0 /usr/local/bin/xtrabackup-s3.sh analyze-chains
 ```
 
 ## Troubleshooting
@@ -434,10 +499,26 @@ mysql-backups/hostname/
    - Ensure the script detects Galera correctly
    - Check `mysql -e "SHOW STATUS LIKE 'wsrep%'"`
 
+### Restore-Specific Issues
+
+1. **"Failed to find valid data directory"**
+   - Backup may be compressed/encrypted
+   - Restore script handles this automatically
+   - Check `/var/tmp` has sufficient space
+
+2. **"Encrypted backup found but no encryption key available"**
+   - Ensure encryption key is in `/root/.my.cnf`
+   - Check `[xtrabackup]` section for `encrypt-key`
+
+3. **"Decompression failed"**
+   - Verify sufficient space in restore directory
+   - Default uses `/var/tmp` which should have space
+   - Use `--restore-dir=/path/with/space` if needed
+
 ### Common Issues
 
 1. **"No previous full backup found"**
-   - Create a full backup first: `./xtrabackup-s3.sh full`
+   - Create a full backup first: `xtrabackup-s3.sh full`
 
 2. **Local-only mode with S3 errors**
    - Use `--local-only` to skip all S3 operations
@@ -448,21 +529,23 @@ mysql-backups/hostname/
    - See configuration section above
 
 4. **"Backup not found for restore"**
-   - Check local backups: `./xtrabackup-s3.sh list --local-only`
-   - Check S3 backups: `./xtrabackup-s3.sh list`
+   - Check local backups: `xtrabackup-s3.sh list --local-only`
+   - Check S3 backups: `xtrabackup-s3.sh list`
    - Verify backup name spelling
 
 ### Debugging
 
 ```bash
 # Test database detection
-./xtrabackup-s3.sh list --local-only
+xtrabackup-s3.sh list --local-only
 
 # Test script syntax
-sh -n ./xtrabackup-s3.sh
+sh -n xtrabackup-s3.sh
+sh -n xtrabackup-s3-restore.sh
 
 # Dry run any operation
-./xtrabackup-s3.sh <command> --dry-run
+xtrabackup-s3.sh <command> --dry-run
+xtrabackup-s3-restore.sh restore <backup> --dry-run
 
 # Check installed tools
 which mariabackup xtrabackup
@@ -472,11 +555,35 @@ mysql -e "SELECT VERSION()"
 
 # Check backup directory
 ls -la $CFG_LOCAL_BACKUP_DIR
+
+# Verify shellcheck compliance
+shellcheck -s sh xtrabackup-s3.sh
+shellcheck -s sh xtrabackup-s3-restore.sh
 ```
 
 ## Migration Guide
 
-### From XtraBackup-only to Universal Script
+### From Single Script to Two-Script Architecture
+
+1. **Update script names:**
+   ```bash
+   # Old: xtrabackup-s3.sh (handled everything)
+   # New: xtrabackup-s3.sh (backup only)
+   #      xtrabackup-s3-restore.sh (restore only)
+   ```
+
+2. **Update cron jobs:**
+   ```bash
+   # No changes needed - backup operations remain in xtrabackup-s3.sh
+   ```
+
+3. **Update restore procedures:**
+   ```bash
+   # Old: xtrabackup-s3.sh restore <backup>
+   # New: xtrabackup-s3-restore.sh restore <backup>
+   ```
+
+### From XtraBackup-only to Universal Scripts
 
 1. **Backup existing config:**
    ```bash
@@ -491,15 +598,18 @@ ls -la $CFG_LOCAL_BACKUP_DIR
 
 3. **Test with dry-run:**
    ```bash
-   ./xtrabackup-s3.sh full --local-only --dry-run
+   xtrabackup-s3.sh full --local-only --dry-run
+   xtrabackup-s3-restore.sh restore <backup> --dry-run
    ```
 
 4. **Verify tool detection:**
    ```bash
-   ./xtrabackup-s3.sh list --local-only
+   xtrabackup-s3.sh list --local-only
    ```
 
 ## Option Reference
+
+### Backup Script Options (`xtrabackup-s3.sh`)
 
 | Option | Description | Available Commands |
 |--------|-------------|-------------------|
@@ -507,7 +617,13 @@ ls -la $CFG_LOCAL_BACKUP_DIR
 | `--cleanup` | Remove old backups after operation | `full`, `inc` |
 | `--no-sync` | Skip S3 sync, local backup only | `full`, `inc` |
 | `--local-only` | Skip ALL S3 operations completely | `full`, `inc`, `list` |
-| `--restore-dir=<path>` | Custom restore directory | `restore-chain` |
+
+### Restore Script Options (`xtrabackup-s3-restore.sh`)
+
+| Option | Description |
+|--------|-------------|
+| `--dry-run` | Preview restore operations without execution |
+| `--restore-dir=<path>` | Custom directory for decompression (default: `/var/tmp/restore_$$`) |
 
 ### Option Comparison
 
@@ -523,11 +639,11 @@ ls -la $CFG_LOCAL_BACKUP_DIR
 
 ```bash
 # Analyze backup chains for issues
-./xtrabackup-s3.sh analyze-chains
+xtrabackup-s3.sh analyze-chains
 
 # Clean up orphaned backups
-./xtrabackup-s3.sh full --cleanup --dry-run
-./xtrabackup-s3.sh full --cleanup
+xtrabackup-s3.sh full --cleanup --dry-run
+xtrabackup-s3.sh full --cleanup
 ```
 
 ### Selective Sync Operations
@@ -535,12 +651,12 @@ ls -la $CFG_LOCAL_BACKUP_DIR
 ```bash
 # Sync only specific backup types
 find /mnt/backup -name "*_full_*" -exec basename {} \; | while read backup; do
-    ./xtrabackup-s3.sh sync "$backup"
+    xtrabackup-s3.sh sync "$backup"
 done
 
 # Sync recent backups only
 find /mnt/backup -name "20*" -mtime -7 -exec basename {} \; | while read backup; do
-    ./xtrabackup-s3.sh sync "$backup"
+    xtrabackup-s3.sh sync "$backup"
 done
 ```
 
@@ -548,22 +664,27 @@ done
 
 ```bash
 # Check backup consistency
-./xtrabackup-s3.sh list --local-only | grep -c "FULL"
-./xtrabackup-s3.sh analyze-chains | grep -c "ORPHANED"
+xtrabackup-s3.sh list --local-only | grep -c "full"
+xtrabackup-s3.sh analyze-chains | grep -c "orphan"
 
 # Monitor backup sizes
 du -sh /mnt/backup/20*
+
+# Verify latest backup is restorable (dry-run)
+LATEST=$(xtrabackup-s3.sh list --local-only | grep full | head -1 | awk '{print $1}')
+xtrabackup-s3-restore.sh restore "$LATEST" --dry-run
 ```
 
 ## Security Notes
 
-- Store encryption keys securely
-- Limit access to configuration files (`chmod 600 /root/.my.cnf`)
+- Store encryption keys securely in `/root/.my.cnf` with mode 0600
+- Limit access to configuration files
 - Use dedicated backup user with minimal database privileges
-- Regularly test restore procedures with both tools
-- Monitor backup success/failure
+- Regularly test restore procedures with both scripts
+- Monitor backup success/failure via exit codes
 - For Galera clusters, consider node-specific backup strategies
 - Rotate backup encryption keys periodically
+- Ensure `/var/tmp` is secured for restore operations
 
 ## Performance Considerations
 
@@ -577,81 +698,36 @@ du -sh /mnt/backup/20*
 - Consider backup compression for large databases
 - Use fast storage for backup destinations
 
+### Restore Operations
+- Ensure `/var/tmp` has sufficient space (2-3x backup size)
+- Use `--restore-dir` to specify alternate location if needed
+- SSD storage recommended for faster restore operations
+
 ### Network Considerations
 - S3 sync operations can be bandwidth-intensive
 - Consider using `--no-sync` during peak hours
 - Monitor S3 transfer costs and quotas
 
+## Script Features
+
+### Backup Script (`xtrabackup-s3.sh`)
+- POSIX shell compliant (shellcheck clean)
+- Automatic database type detection
+- Intelligent incremental backup base selection
+- Chain-aware cleanup operations
+- Comprehensive dry-run support
+
+### Restore Script (`xtrabackup-s3-restore.sh`)
+- Automatic encryption key detection from `.my.cnf`
+- Handles compressed (`.zst`) and encrypted (`.xbcrypt`) backups
+- Smart source selection (local preferred over S3)
+- Safe restore process with service management
+- Configurable working directory for large backups
+
 ## License
 
-This script is provided as-is. Test thoroughly before production use.
+These scripts are provided as-is. Test thoroughly before production use.
 
 ---
 
-**🚀 New in this version**: Universal database support with automatic MariaDB/MySQL detection, Galera cluster support, local-only backup mode for offline environments, and comprehensive chain management tools.-only mode
-
-### Debugging
-
-```bash
-# Test database detection
-./xtrabackup-s3.sh list --local-only
-
-# Dry run any operation
-./xtrabackup-s3.sh <command> --dry-run
-
-# Check installed tools
-which mariabackup xtrabackup
-
-# Test database connectivity  
-mysql -e "SELECT VERSION()"
-```
-
-## Migration Guide
-
-### From XtraBackup-only to Universal Script
-
-1. **Backup existing config:**
-   ```bash
-   cp /root/.my.cnf /root/.my.cnf.backup
-   ```
-
-2. **For MariaDB users - clean config:**
-   ```bash
-   # Remove XtraBackup-specific variables from [client] section
-   # Keep only: user, password
-   ```
-
-3. **Test with dry-run:**
-   ```bash
-   ./xtrabackup-s3.sh full --local-only --dry-run
-   ```
-
-## Option Reference
-
-| Option | Description | Available Commands |
-|--------|-------------|-------------------|
-| `--dry-run` | Preview operations without execution | All commands |
-| `--cleanup` | Remove old backups after operation | `full`, `inc` |
-| `--no-sync` | Skip S3 sync, local backup only | `full`, `inc` |
-| `--local-only` | Skip ALL S3 operations completely | `full`, `inc`, `list` |
-
-### Option Comparison
-
-| Scenario | Use Option | S3 Sync | S3 Cleanup | S3 List |
-|----------|------------|---------|------------|---------|
-| **Full S3 integration** | _(none)_ | ✅ | ✅ | ✅ |
-| **Local backup + manual S3** | `--no-sync` | ❌ | ✅ | ✅ |
-| **Completely offline** | `--local-only` | ❌ | ❌ | ❌ |
-
-## Security Notes
-
-- Store encryption keys securely
-- Limit access to configuration files (`chmod 600 /root/.my.cnf`)
-- Use dedicated backup user with minimal database privileges
-- Regularly test restore procedures with both tools
-- Monitor backup success/failure
-- For Galera clusters, consider node-specific backup strategies
-
-## License
-
-This script is provided as-is. Test thoroughly before production use.
+**🚀 Architecture Update**: Now using two specialized scripts for better separation of concerns - `xtrabackup-s3.sh` for all backup operations and `xtrabackup-s3-restore.sh` for restore operations with automatic handling of encryption and compression.
