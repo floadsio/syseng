@@ -231,19 +231,30 @@ full|inc)
   # ---------------------- Incremental backup ---------------------------
   ########################################################################
   if [ "$OPT_BACKUP_TYPE" = "inc" ]; then
-    LATEST=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name '20*' |
-             sort -r | head -n1)
-    [ -n "$LATEST" ] || { echo "No base backup. Run full first." >&2; exit 1; }
+    LATEST_FULL=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name '*_full_*' | sort -r | head -n1)
+    [ -n "$LATEST_FULL" ] || { echo "No full backup found. Please run full backup first." >&2; exit 1; }
 
-    LATEST_NAME=$(basename "$LATEST")
-    if echo "$LATEST_NAME" | grep -q '_full_'; then
-      BASE_TS=$(echo "$LATEST_NAME" | grep -o '[0-9]*$')
+    FULL_TS=$(basename "$LATEST_FULL" | grep -o '[0-9]*$')
+
+    # Look for incrementals that actually contain checkpoints
+    LATEST_VALID_INC=""
+    for dir in $(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "*_inc_base-${FULL_TS}_*" | sort -r); do
+      if [ -f "$dir/xtrabackup_checkpoints" ]; then
+        LATEST_VALID_INC="$dir"
+        break
+      fi
+    done
+
+    if [ -n "$LATEST_VALID_INC" ]; then
+      BASE="$LATEST_VALID_INC"
     else
-      BASE_TS=$(echo "$LATEST_NAME" | sed 's/.*_inc_base-\([0-9]*\)_.*/\1/')
+      BASE="$LATEST_FULL"
     fi
 
-    LOCAL_DIR="$CFG_LOCAL_BACKUP_DIR/${CFG_DATE}_inc_base-${BASE_TS}_${CFG_TIMESTAMP}"
-    INC_OPT="--incremental-basedir=$LATEST"
+    LOCAL_DIR="$CFG_LOCAL_BACKUP_DIR/${CFG_DATE}_inc_base-${FULL_TS}_${CFG_TIMESTAMP}"
+    INC_OPT="--incremental-basedir=$BASE"
+
+    echo "Incremental base selected: $BASE"
 
     if [ "$OPT_DRY_RUN" -eq 1 ]; then
       echo "# DRY-RUN incremental backup"
