@@ -3,7 +3,8 @@
 
 ##############################################################################
 # Universal MySQL / MariaDB XtraBackup → S3 Script  (pure POSIX /bin/sh)
-# Maintainer : you            Last update : 19 Jul 2025
+# BACKUP OPERATIONS ONLY
+# Maintainer : you            Last update : 20 Jul 2025
 ##############################################################################
 
 set -e
@@ -42,7 +43,6 @@ fi
 ##############################################################################
 OPT_BACKUP_TYPE=${1:-}
 OPT_DRY_RUN=0 OPT_CLEANUP=0 OPT_NO_SYNC=0 OPT_LOCAL_ONLY=0
-OPT_RESTORE_DIR=""
 BACKUP_ARGUMENTS=""
 
 if [ $# -gt 0 ]; then
@@ -53,7 +53,6 @@ if [ $# -gt 0 ]; then
       --cleanup)       OPT_CLEANUP=1 ;;
       --no-sync)       OPT_NO_SYNC=1 ;;
       --local-only)    OPT_LOCAL_ONLY=1 ;;
-      --restore-dir=*) OPT_RESTORE_DIR=${1#*=} ;;
       *)               BACKUP_ARGUMENTS="$BACKUP_ARGUMENTS $1" ;;
     esac
     shift
@@ -160,60 +159,6 @@ list_backups() {
     done
   else
     echo "  [cannot access bucket]"
-  fi
-}
-
-##############################################################################
-prepare_backup() {
-  BACKUP_DIR=$1
-  # shellcheck disable=SC2034
-  IS_FULL=${2:-1}
-
-  DECRYPT_OPTIONS=""
-  ENCRYPT_KEY=""
-
-  # decrypt
-  if find "$BACKUP_DIR" -name '*.xbcrypt' | grep -q .; then
-    if [ -f /root/.my.cnf ]; then
-      ENCRYPT_KEY=$(grep -A10 '^\[xtrabackup\]' /root/.my.cnf |
-        grep '^encrypt-key' | cut -d= -f2 | tr -d ' ')
-    fi
-    [ -z "$ENCRYPT_KEY" ] && [ -n "$CFG_ENCRYPT_KEY" ] && ENCRYPT_KEY=$CFG_ENCRYPT_KEY
-    if [ -n "$ENCRYPT_KEY" ]; then
-      DECRYPT_OPTIONS="--encrypt-key=$ENCRYPT_KEY"
-    elif [ -n "$CFG_ENCRYPT_KEY_FILE" ]; then
-      DECRYPT_OPTIONS="--encrypt-key-file=$CFG_ENCRYPT_KEY_FILE"
-    else
-      echo "ERROR: encrypted backup but no key." >&2
-      return 1
-    fi
-
-    if [ "$BACKUP_TOOL" != "mariabackup" ]; then
-      $BACKUP_CMD --decrypt=AES256 "$DECRYPT_OPTIONS" --target-dir="$BACKUP_DIR"
-    fi
-  fi
-
-  # decompress
-  if find "$BACKUP_DIR" \( -name '*.zst' -o -name '*.qp' \) | grep -q .; then
-    if [ "$BACKUP_TOOL" != "mariabackup" ]; then
-      $BACKUP_CMD --decompress --target-dir="$BACKUP_DIR"
-      find "$BACKUP_DIR" \( -name '*.zst' -o -name '*.qp' \) -exec rm -f {} +
-    fi
-  fi
-
-  # prepare
-  if [ "$BACKUP_TOOL" = "mariabackup" ]; then
-    TMP_CNF=$(mktemp)
-    {
-      echo "[mariabackup]"
-      echo "user=root"
-      grep '^password' /root/.my.cnf 2>/dev/null
-      [ -n "$ENCRYPT_KEY" ] && echo "encrypt-key=$ENCRYPT_KEY"
-    } >"$TMP_CNF"
-    $BACKUP_CMD --defaults-file="$TMP_CNF" --prepare --target-dir="$BACKUP_DIR"
-    rm -f "$TMP_CNF"
-  else
-    $BACKUP_CMD --defaults-file=/root/.my.cnf --prepare --target-dir="$BACKUP_DIR"
   fi
 }
 
@@ -354,82 +299,6 @@ full|inc)
   ;;
 
 ##############################################################################
-restore)
-  FULL_BACKUP=$(echo "$BACKUP_ARGUMENTS" | awk '{print $1}')
-  [ -n "$FULL_BACKUP" ] || { echo "Need backup name." >&2; exit 1; }
-  detect_backup_tool
-
-  RESTORE_DIR=${OPT_RESTORE_DIR:-/var/tmp/restore_$$}
-
-  if [ -d "$CFG_LOCAL_BACKUP_DIR/$FULL_BACKUP" ]; then
-    SRC="$CFG_LOCAL_BACKUP_DIR/$FULL_BACKUP"; SRC_TYPE=local
-  else
-    SRC="$CFG_MC_BUCKET_PATH/$FULL_BACKUP"; SRC_TYPE=s3
-  fi
-
-  if [ "$OPT_DRY_RUN" -eq 1 ]; then
-    echo "# DRY-RUN: full restore procedure"
-    echo "mkdir -p \"$RESTORE_DIR\""
-    if [ "$SRC_TYPE" = local ]; then
-      echo "cp -r \"$SRC\"/. \"$RESTORE_DIR\""
-    else
-      echo "mc mirror --overwrite --remove \"$SRC\" \"$RESTORE_DIR\""
-    fi
-    echo "# decrypt (if *.xbcrypt present)"
-    echo "$BACKUP_CMD --decrypt=AES256 <key-opts> --target-dir=\"$RESTORE_DIR\"    # auto-skipped if not encrypted"
-    echo "# decompress (if *.zst / *.qp present)"
-    echo "$BACKUP_CMD --decompress --target-dir=\"$RESTORE_DIR\"                   # auto-skipped if not compressed"
-    echo "# prepare backup"
-    echo "$BACKUP_CMD --prepare --target-dir=\"$RESTORE_DIR\""
-    echo "systemctl stop mysql"
-    echo "rm -rf /var/lib/mysql/*"
-    echo "$BACKUP_CMD --copy-back --target-dir=\"$RESTORE_DIR\""
-    echo "chown -R mysql:mysql /var/lib/mysql"
-    echo "systemctl start mysql"
-    echo "rm -rf \"$RESTORE_DIR\""
-    exit 0
-  fi
-
-  mkdir -p "$RESTORE_DIR"
-  if [ "$SRC_TYPE" = local ]; then
-    cp -r "$SRC"/. "$RESTORE_DIR"
-  else
-    mc mirror --overwrite --remove "$SRC" "$RESTORE_DIR"
-  fi
-
-  prepare_backup "$RESTORE_DIR" 1
-
-  systemctl stop mysql
-  rm -rf /var/lib/mysql/* && mkdir -p /var/lib/mysql &&
-    chown mysql:mysql /var/lib/mysql && chmod 0750 /var/lib/mysql
-
-  if [ "$BACKUP_TOOL" = "mariabackup" ]; then
-    TMP_CNF=$(mktemp)
-    {
-      echo "[mariabackup]"
-      echo "user=root"
-      grep '^password' /root/.my.cnf 2>/dev/null
-    } >"$TMP_CNF"
-    $BACKUP_CMD --defaults-file="$TMP_CNF" --copy-back --target-dir="$RESTORE_DIR"
-    rm -f "$TMP_CNF"
-  else
-    $BACKUP_CMD --copy-back --target-dir="$RESTORE_DIR"
-  fi
-
-  chown -R mysql:mysql /var/lib/mysql
-  rm -rf "$RESTORE_DIR"
-
-  systemctl start mysql
-  sleep 2
-  if systemctl is-active mysql >/dev/null 2>&1; then
-    echo "✅ Restore complete."
-  else
-    echo "❌ MySQL failed. Check logs." >&2
-    exit 1
-  fi
-  ;;
-
-##############################################################################
 sync)
   FOLDER=$(echo "$BACKUP_ARGUMENTS" | awk '{print $1}')
   [ -n "$FOLDER" ] || { echo "Need folder to sync." >&2; exit 1; }
@@ -504,23 +373,26 @@ analyze-chains) analyze_backup_chains ;;
 list)           list_backups ;;
 *)
   cat <<'EOF'
-Usage: script.sh {full|inc|list|restore|sync|sync-all|delete-chain|analyze-chains} [OPTIONS]
+Usage: xtrabackup-s3.sh {full|inc|list|sync|sync-all|delete-chain|analyze-chains} [OPTIONS]
 
+BACKUP OPERATIONS:
   full                Create a full backup
   inc                 Create an incremental backup
+  
+MANAGEMENT:  
   list                List local & S3 backups
-  restore <backup>    Restore a full backup
   sync <folder>       Sync one local backup folder to S3
   sync-all            Sync every local backup to S3
   delete-chain <full> Delete every incremental for <full>
   analyze-chains      Show backup chains / orphans
 
-Common options
+Common options:
   --dry-run           Print every command, do nothing
   --cleanup           After backup, prune old chains in S3
   --no-sync           Skip S3 mirror step
   --local-only        Ignore S3 entirely (skip mirror / cleanup)
-  --restore-dir=<p>   Custom restore dir (default /var/tmp/restore_PID)
+
+For restore operations, use: xtrabackup-restore.sh
 EOF
   exit 1
   ;;
