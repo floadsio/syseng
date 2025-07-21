@@ -435,9 +435,19 @@ delete-chain)
 ##############################################################################
 analyze-chains) analyze_backup_chains ;;
 list)           list_backups ;;
+##############################################################################
+cleanup)
+  if [ "$OPT_LOCAL_ONLY" -eq 1 ]; then
+    echo "ERROR: --local-only cannot be used with cleanup operation" >&2
+    exit 1
+  fi
+  
+  echo "Running standalone cleanup operation..."
+  cleanup_old_backups
+  ;;
 *)
   cat <<'EOF'
-Usage: xtrabackup-s3.sh {full|inc|list|sync|sync-all|delete-chain|analyze-chains} [OPTIONS]
+Usage: xtrabackup-s3.sh {full|inc|list|sync|sync-all|delete-chain|analyze-chains|cleanup} [OPTIONS]
 
 BACKUP OPERATIONS:
   full                Create a full backup
@@ -449,6 +459,7 @@ MANAGEMENT:
   sync-all            Sync every local backup to S3
   delete-chain <full> Delete every incremental for <full>
   analyze-chains      Show backup chains / orphans
+  cleanup             Prune old backup chains in S3 based on retention settings
 
 Common options:
   --dry-run           Print every command, do nothing
