@@ -1,6 +1,6 @@
 # Universal MySQL/MariaDB XtraBackup S3 Management Scripts
 
-A pair of comprehensive POSIX-compliant shell scripts for managing MySQL and MariaDB backups with automatic tool detection. Supports both Percona XtraBackup (MySQL/Percona) and MariaBackup (MariaDB/Galera) with S3 storage integration, full and incremental backups, encryption, compression, and intelligent backup chain management.
+A pair of comprehensive POSIX-compliant shell scripts for managing MySQL and MariaDB backups with automatic tool detection. Supports both Percona XtraBackup (MySQL/Percona) and MariaBackup (MariaDB/Galera) with S3 storage integration, full and incremental backups, encryption, compression, intelligent backup chain management, and MD5-verified sync operations.
 
 ## Architecture
 
@@ -14,7 +14,7 @@ The system consists of two specialized scripts:
 - **🔄 Universal Database Support**: Auto-detects MySQL/Percona vs MariaDB and uses appropriate backup tool
 - **🎯 Galera Cluster Support**: Native MariaDB Galera cluster backup with `--galera-info`
 - **📦 Full & Incremental Backups**: Automated backup chain management with clear relationships
-- **☁️ S3 Integration**: Seamless sync to S3-compatible storage with MinIO client
+- **☁️ S3 Integration**: Seamless sync to S3-compatible storage with MinIO client and MD5 verification
 - **🔒 Encryption & Compression**: Built-in AES256 encryption and zstd compression
 - **🔗 Backup Chain Tracking**: Smart naming convention to track incremental relationships
 - **🏠 Local-Only Mode**: Complete offline backup support with `--local-only`
@@ -23,6 +23,7 @@ The system consists of two specialized scripts:
 - **👀 Dry-Run Support**: Preview all operations before execution
 - **📊 Chain Analysis**: Analyze backup chains and find orphaned backups
 - **🔧 Automatic Restore Handling**: Decryption, decompression, and preparation in one step
+- **✅ Data Integrity**: MD5 checksum verification during S3 sync operations
 
 ## Database Compatibility
 
@@ -205,6 +206,7 @@ xtrabackup-s3.sh full --local-only --dry-run
 | `sync-all` | Sync all local backups to S3 | Yes |
 | `delete-chain <backup>` | Delete incrementals for a full backup | Yes |
 | `analyze-chains` | Analyze backup chains and find orphans | Yes |
+| `cleanup` | Standalone cleanup of old backup chains in S3 | Yes |
 
 #### Backup Options
 
@@ -220,6 +222,10 @@ xtrabackup-s3.sh inc --local-only
 
 # Preview what would happen (dry run)
 xtrabackup-s3.sh full --cleanup --dry-run
+
+# Standalone cleanup operation (without creating new backup)
+xtrabackup-s3.sh cleanup --dry-run
+xtrabackup-s3.sh cleanup
 ```
 
 ### Restore Operations (`xtrabackup-s3-restore.sh`)
