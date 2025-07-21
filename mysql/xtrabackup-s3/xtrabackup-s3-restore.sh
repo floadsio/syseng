@@ -368,11 +368,43 @@ restore-chain)
       fi
     fi
     
-    # Prepare incremental
-    echo "Preparing incremental $INC_NUM..."
-    if ! prepare_backup "$INC_DIR" 0; then
-      echo "ERROR: Failed to prepare incremental $INC_NAME" >&2
-      exit 1
+    # Prepare incremental (decrypt/decompress only, no --prepare)
+    echo "Decrypting/decompressing incremental $INC_NUM..."
+    # Only decrypt and decompress, don't prepare standalone
+    if find "$INC_DIR" -name '*.xbcrypt' | grep -q .; then
+      echo "Found encrypted files, decrypting..."
+      if [ -f /root/.my.cnf ]; then
+        ENCRYPT_KEY=$(grep -A10 '^\[xtrabackup\]' /root/.my.cnf |
+          grep '^encrypt-key' | cut -d= -f2 | tr -d ' ')
+      fi
+      [ -z "$ENCRYPT_KEY" ] && [ -n "$CFG_ENCRYPT_KEY" ] && ENCRYPT_KEY=$CFG_ENCRYPT_KEY
+      if [ -n "$ENCRYPT_KEY" ]; then
+        DECRYPT_OPTIONS="--encrypt-key=$ENCRYPT_KEY"
+      elif [ -n "$CFG_ENCRYPT_KEY_FILE" ]; then
+        DECRYPT_OPTIONS="--encrypt-key-file=$CFG_ENCRYPT_KEY_FILE"
+      else
+        echo "ERROR: encrypted backup but no key." >&2
+        exit 1
+      fi
+
+      if [ "$BACKUP_TOOL" != "mariabackup" ]; then
+        if ! $BACKUP_CMD --decrypt=AES256 "$DECRYPT_OPTIONS" --target-dir="$INC_DIR"; then
+          echo "ERROR: Failed to decrypt incremental $INC_NAME" >&2
+          exit 1
+        fi
+        find "$INC_DIR" -name '*.xbcrypt' -type f -delete
+      fi
+    fi
+
+    # decompress
+    if find "$INC_DIR" \( -name '*.zst' -o -name '*.qp' \) | grep -q .; then
+      if [ "$BACKUP_TOOL" != "mariabackup" ]; then
+        if ! $BACKUP_CMD --decompress --target-dir="$INC_DIR"; then
+          echo "ERROR: Failed to decompress incremental $INC_NAME" >&2
+          exit 1
+        fi
+        find "$INC_DIR" \( -name '*.zst' -o -name '*.qp' \) -type f -delete
+      fi
     fi
     
     # Apply incremental to full backup
