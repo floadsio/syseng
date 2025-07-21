@@ -348,7 +348,7 @@ restore-chain)
 
   # Apply incrementals in order
   INC_NUM=1
-  while IFS= read -r INC_NAME; do
+  while IFS= read -r INC_NAME || [ -n "$INC_NAME" ]; do
     [ -z "$INC_NAME" ] && continue
     
     echo "Applying incremental $INC_NUM: $INC_NAME"
@@ -357,15 +357,26 @@ restore-chain)
     
     # Download/copy incremental
     if [ "$FULL_SRC_TYPE" = "local" ]; then
-      cp -r "$CFG_LOCAL_BACKUP_DIR/$INC_NAME"/. "$INC_DIR"
+      if ! cp -r "$CFG_LOCAL_BACKUP_DIR/$INC_NAME"/. "$INC_DIR"; then
+        echo "ERROR: Failed to copy incremental $INC_NAME" >&2
+        exit 1
+      fi
     else
-      mc mirror --overwrite --remove "$CFG_MC_BUCKET_PATH/$INC_NAME" "$INC_DIR"
+      if ! mc mirror --overwrite --remove "$CFG_MC_BUCKET_PATH/$INC_NAME" "$INC_DIR"; then
+        echo "ERROR: Failed to download incremental $INC_NAME" >&2
+        exit 1
+      fi
     fi
     
     # Prepare incremental
-    prepare_backup "$INC_DIR" 0
+    echo "Preparing incremental $INC_NUM..."
+    if ! prepare_backup "$INC_DIR" 0; then
+      echo "ERROR: Failed to prepare incremental $INC_NAME" >&2
+      exit 1
+    fi
     
     # Apply incremental to full backup
+    echo "Applying incremental $INC_NUM to restore..."
     if [ "$BACKUP_TOOL" = "mariabackup" ]; then
       TMP_CNF=$(mktemp)
       {
@@ -373,10 +384,18 @@ restore-chain)
         echo "user=root"
         grep '^password' /root/.my.cnf 2>/dev/null
       } >"$TMP_CNF"
-      $BACKUP_CMD --defaults-file="$TMP_CNF" --prepare --apply-log-only --target-dir="$RESTORE_DIR" --incremental-dir="$INC_DIR"
+      
+      if ! $BACKUP_CMD --defaults-file="$TMP_CNF" --prepare --apply-log-only --target-dir="$RESTORE_DIR" --incremental-dir="$INC_DIR"; then
+        echo "ERROR: Failed to apply incremental $INC_NAME" >&2
+        rm -f "$TMP_CNF"
+        exit 1
+      fi
       rm -f "$TMP_CNF"
     else
-      $BACKUP_CMD --prepare --apply-log-only --target-dir="$RESTORE_DIR" --incremental-dir="$INC_DIR"
+      if ! $BACKUP_CMD --prepare --apply-log-only --target-dir="$RESTORE_DIR" --incremental-dir="$INC_DIR"; then
+        echo "ERROR: Failed to apply incremental $INC_NAME" >&2
+        exit 1
+      fi
     fi
     
     # Clean up incremental directory
