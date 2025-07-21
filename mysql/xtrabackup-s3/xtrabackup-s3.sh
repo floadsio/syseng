@@ -122,23 +122,43 @@ sync_to_s3() {
 
 ##############################################################################
 cleanup_old_backups() {
-  echo "Pruning old chains in S3 …"
+  echo "Pruning old chains in S3 with chain integrity protection…"
   CUTOFF_DATE=$(date -d "$CFG_CUTOFF_DAYS days ago" +%Y-%m-%d)
   CUTOFF_NUM=$(echo "$CUTOFF_DATE" | tr -d '-')
 
   TMP=$(mktemp)
+  TMP_CHAINS=$(mktemp)
   mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | sed 's:/$::' | sort >"$TMP"
 
+  # Build chain analysis: full_backup -> newest_incremental_date
   grep "_full_" "$TMP" | while read -r FULL; do
     [ -z "$FULL" ] && continue
-    FULL_DATE=$(echo "$FULL" | cut -d_ -f1)
-    FULL_NUM=$(echo "$FULL_DATE" | tr -d '-')
     FULL_TS=$(echo "$FULL" | grep -o '[0-9]*$')
+    FULL_DATE=$(echo "$FULL" | cut -d_ -f1)
+    
+    # Find newest incremental in this chain
+    NEWEST_INC_DATE="$FULL_DATE"
+    grep "_inc_base-${FULL_TS}_" "$TMP" | while read -r INC; do
+      [ -z "$INC" ] && continue
+      INC_DATE=$(echo "$INC" | cut -d_ -f1)
+      if [ "$INC_DATE" \> "$NEWEST_INC_DATE" ]; then
+        NEWEST_INC_DATE="$INC_DATE"
+      fi
+    done
+    
+    echo "$FULL|$NEWEST_INC_DATE|$FULL_TS" >> "$TMP_CHAINS"
+  done
 
-    if [ "$FULL_NUM" -lt "$CUTOFF_NUM" ]; then
-      echo "  Removing chain rooted at $FULL"
-      grep "_inc_base-${FULL_TS}_" "$TMP" |
-      while read -r INC; do
+  # Only delete chains where NEWEST backup (full or incremental) is older than cutoff
+  while IFS='|' read -r FULL NEWEST_DATE FULL_TS; do
+    [ -z "$FULL" ] && continue
+    NEWEST_NUM=$(echo "$NEWEST_DATE" | tr -d '-')
+    
+    if [ "$NEWEST_NUM" -lt "$CUTOFF_NUM" ]; then
+      echo "  ✅ Removing chain rooted at $FULL (newest backup: $NEWEST_DATE)"
+      
+      # Delete all incrementals in chain
+      grep "_inc_base-${FULL_TS}_" "$TMP" | while read -r INC; do
         [ -z "$INC" ] && continue
         if [ "$OPT_DRY_RUN" -eq 1 ]; then
           echo "    [DRY-RUN] mc rb --force \"$CFG_MC_BUCKET_PATH/$INC\""
@@ -146,14 +166,19 @@ cleanup_old_backups() {
           mc rb --force "$CFG_MC_BUCKET_PATH/$INC"
         fi
       done
+      
+      # Delete full backup
       if [ "$OPT_DRY_RUN" -eq 1 ]; then
         echo "    [DRY-RUN] mc rb --force \"$CFG_MC_BUCKET_PATH/$FULL\""
       else
         mc rb --force "$CFG_MC_BUCKET_PATH/$FULL"
       fi
+    else
+      echo "  🔒 Preserving chain rooted at $FULL (newest backup: $NEWEST_DATE, within retention)"
     fi
-  done
-  rm -f "$TMP"
+  done < "$TMP_CHAINS"
+  
+  rm -f "$TMP" "$TMP_CHAINS"
 }
 
 ##############################################################################

@@ -329,6 +329,140 @@ The scripts use an intelligent naming convention to track backup relationships:
 
 The `base-TIMESTAMP` clearly shows which full backup each incremental belongs to.
 
+## Backup Chain Integrity & Retention
+
+### 🔒 Chain-Aware Retention Logic
+
+The backup script implements **intelligent retention logic** that ensures backup chain integrity:
+
+#### How It Works
+
+1. **Analyzes entire chains** - not just individual backup dates
+2. **Preserves chains with recent incrementals** - even if the full backup is old
+3. **Only deletes complete chains** - where ALL backups (including incrementals) are older than retention period
+4. **Prevents orphaned incrementals** - that would be unrestorable without their base full backup
+
+#### Example Scenarios
+
+**✅ Safe Retention (Chain Preserved):**
+```bash
+# Retention: 7 days, Current date: 2025-07-25
+
+📁 2025-07-15_full_1750928269 (10 days old - normally would be deleted)
+  ↳ 2025-07-22_inc_base-1750928269_1750939200 (3 days old - within retention)
+  ↳ 2025-07-24_inc_base-1750928269_1750960800 (1 day old - within retention)
+
+# Result: 🔒 Entire chain PRESERVED because newest incremental is within retention
+# Output: "Preserving chain rooted at 2025-07-15_full_1750928269 (newest backup: 2025-07-24, within retention)"
+```
+
+**✅ Safe Retention (Chain Deleted):**
+```bash
+# Retention: 7 days, Current date: 2025-07-25
+
+📁 2025-07-10_full_1750928270 (15 days old)
+  ↳ 2025-07-12_inc_base-1750928270_1750939201 (13 days old)
+  ↳ 2025-07-15_inc_base-1750928270_1750960801 (10 days old)
+
+# Result: ✅ Entire chain DELETED because ALL backups are older than retention
+# Output: "Removing chain rooted at 2025-07-10_full_1750928270 (newest backup: 2025-07-15)"
+```
+
+#### Retention Configuration
+
+```bash
+# ~/.xtrabackup-s3.conf
+CFG_CUTOFF_DAYS=7  # Only delete chains where ALL backups are older than 7 days
+```
+
+#### Testing Retention Logic
+
+```bash
+# Preview what would be deleted (safe to run)
+xtrabackup-s3.sh full --cleanup --dry-run
+
+# Example output:
+# Pruning old chains in S3 with chain integrity protection…
+# 🔒 Preserving chain rooted at 2025-07-15_full_1750928269 (newest backup: 2025-07-24, within retention)
+# ✅ Removing chain rooted at 2025-07-10_full_1750928270 (newest backup: 2025-07-15)
+#   [DRY-RUN] mc rb --force "s3://bucket/2025-07-12_inc_base-1750928270_1750939201"
+#   [DRY-RUN] mc rb --force "s3://bucket/2025-07-15_inc_base-1750928270_1750960801"
+#   [DRY-RUN] mc rb --force "s3://bucket/2025-07-10_full_1750928270"
+```
+
+### 🛡️ Protection Against Data Loss
+
+#### Common Retention Pitfalls (Avoided)
+
+**❌ Naive Approach (Dangerous):**
+```bash
+# BAD: Only considers full backup date
+if full_backup_date < cutoff_date:
+    delete_entire_chain()  # Could delete recent incrementals!
+```
+
+**✅ Chain-Aware Approach (Safe):**
+```bash
+# GOOD: Considers newest backup in entire chain
+newest_backup_in_chain = max(full_date, all_incremental_dates)
+if newest_backup_in_chain < cutoff_date:
+    delete_entire_chain()  # Safe - all backups are old
+```
+
+#### Verification Commands
+
+```bash
+# Analyze backup chains before cleanup
+xtrabackup-s3.sh analyze-chains
+
+# Example output shows chain relationships:
+# === BACKUP CHAIN ANALYSIS ===
+# 📁 2025-07-15_full_1750928269  ↳ 3 incrementals
+# 📁 2025-07-20_full_1750928270  [stand-alone]
+# === END ANALYSIS ===
+
+# Test retention logic safely
+xtrabackup-s3.sh full --cleanup --dry-run
+
+# Monitor what gets preserved vs deleted
+# Look for: 🔒 Preserving vs ✅ Removing messages
+```
+
+### 📊 Retention Best Practices
+
+#### Recommended Retention Strategies
+
+**Conservative (Safer):**
+```bash
+CFG_CUTOFF_DAYS=14  # Keep chains for 2 weeks
+CFG_LOCAL_BACKUP_KEEP_COUNT=6  # Keep 6 local backups
+```
+
+**Aggressive (Space-saving):**
+```bash
+CFG_CUTOFF_DAYS=7   # Keep chains for 1 week
+CFG_LOCAL_BACKUP_KEEP_COUNT=3  # Keep 3 local backups
+```
+
+**Production (Balanced):**
+```bash
+CFG_CUTOFF_DAYS=10  # Keep chains for 10 days
+CFG_LOCAL_BACKUP_KEEP_COUNT=4  # Keep 4 local backups
+```
+
+#### Monitoring Chain Health
+
+```bash
+# Weekly chain analysis (add to cron)
+0 3 * * 0 /usr/local/bin/xtrabackup-s3.sh analyze-chains
+
+# Monthly retention review (dry-run)
+0 4 1 * * /usr/local/bin/xtrabackup-s3.sh full --cleanup --dry-run
+
+# Alert on orphaned backups
+xtrabackup-s3.sh analyze-chains | grep -q "orphan" && echo "WARNING: Orphaned backups found"
+```
+
 ## Workflow Examples
 
 ### MariaDB Galera Cluster Strategy
