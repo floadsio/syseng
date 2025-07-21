@@ -230,6 +230,16 @@ The restore script handles all complexities of restoration including:
 - Decompression of zstd/qpress files
 - Proper preparation of backup
 - Safe restoration to MySQL data directory
+- **Full backup chain restoration** with incremental support
+
+#### Available Restore Commands
+
+| Command | Description | Use Case |
+|---------|-------------|----------|
+| `restore <backup>` | Restore a single full backup | Simple full backup restoration |
+| `restore-chain <full> [target_inc]` | Restore full + incrementals up to target | Point-in-time recovery with incrementals |
+| `list` | List local & S3 backups | View available backups |
+| `analyze-chains` | Show backup chains and orphans | Analyze backup relationships |
 
 #### Smart Restore Logic
 
@@ -243,6 +253,12 @@ The restore script intelligently chooses between local and S3 backups:
 ```bash
 # Restore from local backup (if available) or S3
 xtrabackup-s3-restore.sh restore 2025-07-18_08-57-49_full_1750928269
+
+# Restore full backup + all incrementals in chain
+xtrabackup-s3-restore.sh restore-chain 2025-07-18_08-57-49_full_1750928269
+
+# Restore up to specific incremental (point-in-time recovery)
+xtrabackup-s3-restore.sh restore-chain 2025-07-18_08-57-49_full_1750928269 2025-07-18_12-00-00_inc_base-1750928269_1750939200
 
 # Preview restore operation
 xtrabackup-s3-restore.sh restore 2025-07-18_08-57-49_full_1750928269 --dry-run
@@ -624,6 +640,8 @@ shellcheck -s sh xtrabackup-s3-restore.sh
 |--------|-------------|
 | `--dry-run` | Preview restore operations without execution |
 | `--restore-dir=<path>` | Custom directory for decompression (default: `/var/tmp/restore_$$`) |
+
+**Note**: The restore script automatically handles MariaDB vs MySQL differences, creating appropriate temporary configuration files and using the correct backup tool parameters for each database type.
 
 ### Option Comparison
 
