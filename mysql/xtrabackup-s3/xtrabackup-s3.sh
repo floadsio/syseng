@@ -138,13 +138,23 @@ cleanup_old_backups() {
     
     # Find newest incremental in this chain
     NEWEST_INC_DATE="$FULL_DATE"
-    grep "_inc_base-${FULL_TS}_" "$TMP" | while read -r INC; do
-      [ -z "$INC" ] && continue
-      INC_DATE=$(echo "$INC" | cut -d_ -f1)
-      if [ "$INC_DATE" \> "$NEWEST_INC_DATE" ]; then
-        NEWEST_INC_DATE="$INC_DATE"
-      fi
-    done
+    
+    # Create a temporary file for incrementals in this chain
+    TMP_INCS=$(mktemp)
+    grep "_inc_base-${FULL_TS}_" "$TMP" > "$TMP_INCS"
+    
+    # Process each incremental backup without a pipeline
+    if [ -s "$TMP_INCS" ]; then
+      while read -r INC; do
+        [ -z "$INC" ] && continue
+        INC_DATE=$(echo "$INC" | cut -d_ -f1)
+        # POSIX-compliant string comparison
+        if [ "$INC_DATE" != "$NEWEST_INC_DATE" ] && [ "$(printf '%s\n%s' "$NEWEST_INC_DATE" "$INC_DATE" | sort | tail -n1)" = "$INC_DATE" ]; then
+          NEWEST_INC_DATE="$INC_DATE"
+        fi
+      done < "$TMP_INCS"
+    fi
+    rm -f "$TMP_INCS"
     
     echo "$FULL|$NEWEST_INC_DATE|$FULL_TS" >> "$TMP_CHAINS"
   done
