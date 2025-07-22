@@ -10,6 +10,17 @@
 set -e
 
 # ---------------------------------------------------------------------------
+# Lock file to prevent concurrent runs
+# ---------------------------------------------------------------------------
+LOCK_FILE="/tmp/xtrabackup-s3.lock"
+if [ -f "$LOCK_FILE" ]; then
+  echo "ERROR: Another backup is already running (lock file exists: $LOCK_FILE)." >&2
+  exit 1
+fi
+trap 'rm -f "$LOCK_FILE"' EXIT
+touch "$LOCK_FILE"
+
+# ---------------------------------------------------------------------------
 # Static placeholders (kept for compatibility / hooks)
 # ---------------------------------------------------------------------------
 # shellcheck disable=SC2034
