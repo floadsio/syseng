@@ -5,6 +5,10 @@
 
 set -e
 
+# Memory-conservative settings for Go processes (rclone/restic)
+export GOMAXPROCS=1   # https://restic.readthedocs.io/en/stable/047_tuning_backup_parameters.html#cpu-usage
+export GOGC=20        # https://forum.restic.net/t/restic-uses-more-than-4gb-ram-on-14gb-backup-than-crashes/4584
+
 # Load configuration
 CONFIG_FILE="$HOME/.autorestic-rclone.conf"
 if [ ! -f "$CONFIG_FILE" ]; then
@@ -133,11 +137,11 @@ mount_buckets() {
             --no-modtime \
             --vfs-fast-fingerprint \
             --cache-dir=restic-cache \
-            --vfs-cache-mode=full \
-            --vfs-cache-max-age=12h \
-            --vfs-write-back=15m \
-            --buffer-size=16M \
-            --vfs-read-ahead=128M \
+            --vfs-cache-mode=writes \
+            --vfs-cache-max-age=1h \
+            --vfs-write-back=5m \
+            --buffer-size=4M \
+            --vfs-read-ahead=32M \
             --daemon || {
             echo "Failed to mount $bucket"
             exit 1
@@ -234,11 +238,11 @@ mount_all_locations() {
                 --no-modtime \
                 --vfs-fast-fingerprint \
                 --cache-dir=restic-cache \
-                --vfs-cache-mode=full \
-                --vfs-cache-max-age=12h \
-                --vfs-write-back=15m \
-                --buffer-size=16M \
-                --vfs-read-ahead=128M \
+                --vfs-cache-mode=writes \
+                --vfs-cache-max-age=1h \
+                --vfs-write-back=5m \
+                --buffer-size=4M \
+                --vfs-read-ahead=32M \
                 --daemon || {
                 echo "Failed to mount $bucket"
                 exit 1
