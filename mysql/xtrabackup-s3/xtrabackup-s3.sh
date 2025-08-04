@@ -253,19 +253,32 @@ full|inc)
   # ---------------------- Incremental backup ---------------------------
   ########################################################################
   if [ "$OPT_BACKUP_TYPE" = "inc" ]; then
-    LATEST_BACKUP=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "20*" | sort -r | head -n 1)
-    if [ -z "$LATEST_BACKUP" ]; then
-        echo "No previous backup found in $CFG_LOCAL_BACKUP_DIR. Please run a full backup first."
+    # Find the most recent full backup
+    LATEST_FULL_BACKUP=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "*_full_*" | sort -r | head -n 1)
+    if [ -z "$LATEST_FULL_BACKUP" ]; then
+        echo "No full backup found in $CFG_LOCAL_BACKUP_DIR. Please run a full backup first."
         exit 1
     fi
 
-    LATEST_BACKUP_NAME=$(basename "$LATEST_BACKUP")
-    if echo "$LATEST_BACKUP_NAME" | grep -q "_full_"; then
-        BASE_TIMESTAMP=$(echo "$LATEST_BACKUP_NAME" | grep -o '[0-9]*$')
+    # Get the full backup timestamp for chain tracking
+    FULL_BACKUP_NAME=$(basename "$LATEST_FULL_BACKUP")
+    BASE_TIMESTAMP=$(echo "$FULL_BACKUP_NAME" | grep -o '[0-9]*$')
+
+    # Check if there are any incrementals for this full backup
+    LATEST_INC_FOR_FULL=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "*_inc_base-${BASE_TIMESTAMP}_*" | sort -r | head -n 1)
+
+    if [ -n "$LATEST_INC_FOR_FULL" ]; then
+        # Use the latest incremental as base (chain incrementals)
+        LATEST_BACKUP="$LATEST_INC_FOR_FULL"
+        echo "Using latest incremental as base: $(basename "$LATEST_BACKUP")"
     else
-        BASE_TIMESTAMP=$(echo "$LATEST_BACKUP_NAME" | sed 's/.*_inc_base-\([0-9]*\)_.*/\1/')
+        # Use the full backup as base (first incremental in chain)
+        LATEST_BACKUP="$LATEST_FULL_BACKUP"
+        echo "Using full backup as base: $(basename "$LATEST_BACKUP")"
     fi
 
+    # Remove any trailing slash to prevent double slash issue
+    LATEST_BACKUP=$(echo "$LATEST_BACKUP" | sed 's:/$::')
     CFG_INCREMENTAL="--incremental-basedir=$LATEST_BACKUP"
     LOCAL_BACKUP_DIR="${CFG_LOCAL_BACKUP_DIR}/${CFG_DATE}_${OPT_BACKUP_TYPE}_base-${BASE_TIMESTAMP}_${CFG_TIMESTAMP}"
 
