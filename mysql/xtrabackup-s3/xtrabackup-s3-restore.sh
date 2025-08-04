@@ -58,6 +58,96 @@ detect_backup_tool() {
 }
 
 ##############################################################################
+detect_os() {
+  if [ "$(uname)" = "FreeBSD" ]; then
+    OS_TYPE="freebsd"
+    MYSQL_DATADIR="/var/db/mysql"
+  else
+    OS_TYPE="linux"
+    MYSQL_DATADIR="/var/lib/mysql"
+  fi
+}
+
+##############################################################################
+mysql_service_control() {
+  ACTION=$1
+  
+  if [ "$OS_TYPE" = "freebsd" ]; then
+    case "$ACTION" in
+      stop)  service mysql-server stop ;;
+      start) service mysql-server start ;;
+      status) service mysql-server status >/dev/null 2>&1 ;;
+    esac
+  else
+    case "$ACTION" in
+      stop)  systemctl stop mysql ;;
+      start) systemctl start mysql ;;
+      status) systemctl is-active mysql >/dev/null 2>&1 ;;
+    esac
+  fi
+}
+
+##############################################################################
+check_galera_cluster() {
+  # Check if this is a Galera cluster by looking for wsrep settings
+  GALERA_DETECTED=0
+  
+  # Check my.cnf files for wsrep settings
+  for CNF in /etc/mysql/my.cnf /etc/my.cnf /root/.my.cnf "$MYSQL_DATADIR"/my.cnf; do
+    if [ -f "$CNF" ] && grep -q "wsrep_" "$CNF" 2>/dev/null; then
+      GALERA_DETECTED=1
+      break
+    fi
+  done
+  
+  # Also check if grastate.dat exists (Galera state file)
+  if [ -f "$MYSQL_DATADIR/grastate.dat" ]; then
+    GALERA_DETECTED=1
+  fi
+  
+  if [ "$GALERA_DETECTED" -eq 1 ]; then
+    echo "⚠️  GALERA CLUSTER DETECTED ⚠️"
+    echo ""
+    echo "This appears to be a Galera cluster node. For a proper restore:"
+    echo ""
+    echo "1. STOP MariaDB/MySQL on ALL cluster nodes first:"
+    if [ "$OS_TYPE" = "freebsd" ]; then
+      echo "   sudo service mysql-server stop"
+    else
+      echo "   sudo systemctl stop mysql"
+    fi
+    echo ""
+    echo "2. Clear data directories on ALL nodes (if doing full cluster restore)"
+    echo "3. Restore backup on ONE node (this node)"
+    echo "4. Bootstrap cluster from this node"
+    echo "5. Start other nodes normally (they'll sync via SST)"
+    echo ""
+    echo "Have you stopped MariaDB on ALL cluster nodes? [Y/n]"
+    
+    if [ -t 0 ]; then  # Only prompt if running interactively
+      read -r CONFIRM
+      case "$CONFIRM" in
+        [nN]|[nN][oO])
+          echo "❌ Please stop MariaDB on all cluster nodes first."
+          echo "   Then run this restore command again."
+          exit 1
+          ;;
+        ""|[yY]|[yY][eE][sS])
+          echo "✅ Proceeding with cluster restore..."
+          ;;
+        *)
+          echo "❌ Invalid response. Please answer Y or N."
+          exit 1
+          ;;
+      esac
+    else
+      echo "⚠️  Running non-interactively - assuming cluster is properly stopped."
+    fi
+    echo ""
+  fi
+}
+
+##############################################################################
 prepare_backup() {
   BACKUP_DIR=$1
   APPLY_LOGS=${2:-1}
@@ -100,7 +190,7 @@ prepare_backup() {
     {
       echo "[mariabackup]"
       echo "user=root"
-      grep '^password' /root/.my.cnf 2>/dev/null
+      grep '^password' /root/.my.cnf 2>/dev/null || true || true
       [ -n "$ENCRYPT_KEY" ] && echo "encrypt-key=$ENCRYPT_KEY"
     } >"$TMP_CNF"
     
@@ -174,8 +264,12 @@ restore)
   FULL_BACKUP=$(echo "$RESTORE_ARGUMENTS" | awk '{print $1}')
   [ -n "$FULL_BACKUP" ] || { echo "Need backup name." >&2; exit 1; }
   detect_backup_tool
+  detect_os
 
-  RESTORE_DIR=${OPT_RESTORE_DIR:-/var/tmp/restore_$$}
+  # Check for Galera cluster and warn user
+  check_galera_cluster
+
+  RESTORE_DIR=${OPT_RESTORE_DIR:-/var/tmp/restore_$}
 
   if [ -d "$CFG_LOCAL_BACKUP_DIR/$FULL_BACKUP" ]; then
     SRC="$CFG_LOCAL_BACKUP_DIR/$FULL_BACKUP"; SRC_TYPE=local
@@ -192,11 +286,23 @@ restore)
       echo "mc mirror --overwrite --remove \"$SRC\" \"$RESTORE_DIR\""
     fi
     echo "$BACKUP_CMD --prepare --target-dir=\"$RESTORE_DIR\""
-    echo "systemctl stop mysql"
-    echo "rm -rf /var/lib/mysql/*"
+    
+    if [ "$OS_TYPE" = "freebsd" ]; then
+      echo "service mysql-server stop"
+    else
+      echo "systemctl stop mysql"
+    fi
+    
+    echo "rm -rf $MYSQL_DATADIR/*"
     echo "$BACKUP_CMD --copy-back --target-dir=\"$RESTORE_DIR\""
-    echo "chown -R mysql:mysql /var/lib/mysql"
-    echo "systemctl start mysql"
+    echo "chown -R mysql:mysql $MYSQL_DATADIR"
+    
+    if [ "$OS_TYPE" = "freebsd" ]; then
+      echo "service mysql-server start"
+    else
+      echo "systemctl start mysql"
+    fi
+    
     echo "rm -rf \"$RESTORE_DIR\""
     exit 0
   fi
@@ -210,16 +316,23 @@ restore)
 
   prepare_backup "$RESTORE_DIR" 1
 
-  systemctl stop mysql
-  rm -rf /var/lib/mysql/* && mkdir -p /var/lib/mysql &&
-    chown mysql:mysql /var/lib/mysql && chmod 0750 /var/lib/mysql
+  # Check if MySQL is running before trying to stop it
+  if mysql_service_control status; then
+    echo "Stopping MySQL service..."
+    mysql_service_control stop
+  else
+    echo "MySQL service already stopped."
+  fi
+  
+  rm -rf $MYSQL_DATADIR/* && mkdir -p $MYSQL_DATADIR &&
+    chown mysql:mysql $MYSQL_DATADIR && chmod 0750 $MYSQL_DATADIR
 
   if [ "$BACKUP_TOOL" = "mariabackup" ]; then
     TMP_CNF=$(mktemp)
     {
       echo "[mariabackup]"
       echo "user=root"
-      grep '^password' /root/.my.cnf 2>/dev/null
+      grep '^password' /root/.my.cnf 2>/dev/null || true
     } >"$TMP_CNF"
     $BACKUP_CMD --defaults-file="$TMP_CNF" --copy-back --target-dir="$RESTORE_DIR"
     rm -f "$TMP_CNF"
@@ -227,12 +340,12 @@ restore)
     $BACKUP_CMD --copy-back --target-dir="$RESTORE_DIR"
   fi
 
-  chown -R mysql:mysql /var/lib/mysql
+  chown -R mysql:mysql $MYSQL_DATADIR
   rm -rf "$RESTORE_DIR"
 
-  systemctl start mysql
+  mysql_service_control start
   sleep 2
-  if systemctl is-active mysql >/dev/null 2>&1; then
+  if mysql_service_control status; then
     echo "✅ Restore complete."
   else
     echo "❌ MySQL failed. Check logs." >&2
@@ -246,6 +359,10 @@ restore-chain)
   TARGET_INC=$(echo "$RESTORE_ARGUMENTS" | awk '{print $2}')
   [ -n "$FULL_BACKUP" ] || { echo "Need full backup name." >&2; exit 1; }
   detect_backup_tool
+  detect_os
+
+  # Check for Galera cluster and warn user
+  check_galera_cluster
 
   TS=$(echo "$FULL_BACKUP" | grep -o '[0-9]*$')
   [ -n "$TS" ] || { echo "Cannot extract timestamp from backup name." >&2; exit 1; }
@@ -321,11 +438,22 @@ restore-chain)
     done < "$TMP_INCS"
     
     echo "$BACKUP_CMD --prepare --target-dir=\"$RESTORE_DIR\""
-    echo "systemctl stop mysql"
-    echo "rm -rf /var/lib/mysql/*"
+    
+    if [ "$OS_TYPE" = "freebsd" ]; then
+      echo "service mysql-server stop"
+    else
+      echo "systemctl stop mysql"
+    fi
+    
+    echo "rm -rf $MYSQL_DATADIR/*"
     echo "$BACKUP_CMD --copy-back --target-dir=\"$RESTORE_DIR\""
-    echo "chown -R mysql:mysql /var/lib/mysql"
-    echo "systemctl start mysql"
+    echo "chown -R mysql:mysql $MYSQL_DATADIR"
+    
+    if [ "$OS_TYPE" = "freebsd" ]; then
+      echo "service mysql-server start"
+    else
+      echo "systemctl start mysql"
+    fi
     echo "rm -rf \"$RESTORE_DIR\"*"
     rm -f "$TMP_INCS"
     exit 0
@@ -452,9 +580,15 @@ restore-chain)
 
   # Stop MySQL and restore
   echo "Stopping MySQL and restoring data..."
-  systemctl stop mysql
-  rm -rf /var/lib/mysql/* && mkdir -p /var/lib/mysql &&
-    chown mysql:mysql /var/lib/mysql && chmod 0750 /var/lib/mysql
+  if mysql_service_control status; then
+    echo "Stopping MySQL service..."
+    mysql_service_control stop
+  else
+    echo "MySQL service already stopped."
+  fi
+  
+  rm -rf $MYSQL_DATADIR/* && mkdir -p $MYSQL_DATADIR &&
+    chown mysql:mysql $MYSQL_DATADIR && chmod 0750 $MYSQL_DATADIR
 
   if [ "$BACKUP_TOOL" = "mariabackup" ]; then
     TMP_CNF=$(mktemp)
@@ -469,13 +603,13 @@ restore-chain)
     $BACKUP_CMD --copy-back --target-dir="$RESTORE_DIR"
   fi
 
-  chown -R mysql:mysql /var/lib/mysql
+  chown -R mysql:mysql $MYSQL_DATADIR
   rm -rf "$RESTORE_DIR"
   rm -f "$TMP_INCS"
 
-  systemctl start mysql
+  mysql_service_control start
   sleep 2
-  if systemctl is-active mysql >/dev/null 2>&1; then
+  if mysql_service_control status; then
     echo "✅ Chain restore complete."
   else
     echo "❌ MySQL failed. Check logs." >&2
