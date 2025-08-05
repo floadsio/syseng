@@ -30,6 +30,7 @@ fi
 ##############################################################################
 OPT_RESTORE_TYPE=${1:-}
 OPT_DRY_RUN=0
+OPT_REPORT=0
 OPT_RESTORE_DIR=""
 RESTORE_ARGUMENTS=""
 
@@ -37,7 +38,8 @@ if [ $# -gt 0 ]; then
   shift
   while [ "$1" ]; do
     case "$1" in
-      --dry-run)       OPT_DRY_RUN=1 ;;
+      --dry-run) OPT_DRY_RUN=1 ;;
+      --report) OPT_REPORT=1 ;;
       --restore-dir=*) OPT_RESTORE_DIR=${1#*=} ;;
       *)               RESTORE_ARGUMENTS="$RESTORE_ARGUMENTS $1" ;;
     esac
@@ -235,23 +237,14 @@ list_backups() {
 }
 
 ##############################################################################
-analyze_backup_chains() {
-  echo "=== BACKUP CHAIN ANALYSIS ==="
-  TMP=$(mktemp)
-  mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | sed 's:/$::' | sort >"$TMP"
-
-  grep "_full_" "$TMP" | while read -r FULL; do
-    [ -z "$FULL" ] && continue
-    TS=$(echo "$FULL" | grep -o '[0-9]*$')
-    INC_COUNT=$(grep -c "_inc_base-${TS}_" "$TMP")
-    if [ "$INC_COUNT" -gt 0 ]; then
-      echo "📁 $FULL  ↳ $INC_COUNT incrementals"
-    else
-      echo "📁 $FULL  [stand-alone]"
-    fi
-  done
-  rm -f "$TMP"
-  echo "=== END ANALYSIS ==="
+# Report generation
+##############################################################################
+generate_report() {
+  REPORT_CONTENT=$(cat "/tmp/restore_report_$$")
+  echo "##############################################################################"
+  echo "### RESTORE REPORT"
+  echo "##############################################################################"
+  echo "$REPORT_CONTENT"
 }
 
 ##############################################################################
@@ -269,7 +262,12 @@ restore)
   # Check for Galera cluster and warn user
   check_galera_cluster
 
-  RESTORE_DIR=${OPT_RESTORE_DIR:-/var/tmp/restore_$}
+  # Report variables
+  START_TIME=$(date +%s)
+  REPORT_FILE="/tmp/restore_report_$$"
+  echo "Restore started on $(date)" > "$REPORT_FILE"
+
+  RESTORE_DIR=${OPT_RESTORE_DIR:-/var/tmp/restore_$$}
 
   if [ -d "$CFG_LOCAL_BACKUP_DIR/$FULL_BACKUP" ]; then
     SRC="$CFG_LOCAL_BACKUP_DIR/$FULL_BACKUP"; SRC_TYPE=local
@@ -307,14 +305,27 @@ restore)
     exit 0
   fi
 
+  echo "Downloading backup..." | tee -a "$REPORT_FILE"
+  DOWNLOAD_START=$(date +%s)
   mkdir -p "$RESTORE_DIR"
   if [ "$SRC_TYPE" = local ]; then
     cp -r "$SRC"/. "$RESTORE_DIR"
+    BACKUP_SIZE=$(du -sh "$SRC" | awk '{print $1}')
   else
     mc mirror --overwrite --remove "$SRC" "$RESTORE_DIR"
+    BACKUP_SIZE=$(mc du "$SRC" | awk '{print $1}')
   fi
+  DOWNLOAD_END=$(date +%s)
+  echo "Backup Size: $BACKUP_SIZE" >> "$REPORT_FILE"
+  echo "Download took $((DOWNLOAD_END - DOWNLOAD_START)) seconds" >> "$REPORT_FILE"
+  echo "" >> "$REPORT_FILE"
 
+  echo "Preparing backup..." | tee -a "$REPORT_FILE"
+  PREPARE_START=$(date +%s)
   prepare_backup "$RESTORE_DIR" 1
+  PREPARE_END=$(date +%s)
+  echo "Preparation took $((PREPARE_END - PREPARE_START)) seconds" >> "$REPORT_FILE"
+  echo "" >> "$REPORT_FILE"
 
   # Check if MySQL is running before trying to stop it
   if mysql_service_control status; then
@@ -324,10 +335,13 @@ restore)
     echo "MySQL service already stopped."
   fi
   
-  rm -rf $MYSQL_DATADIR/* && mkdir -p $MYSQL_DATADIR &&
-    chown mysql:mysql $MYSQL_DATADIR && chmod 0750 $MYSQL_DATADIR
+  echo "Copying back data..." | tee -a "$REPORT_FILE"
+  COPY_START=$(date +%s)
+  
+  rm -rf "$MYSQL_DATADIR"/* && mkdir -p "$MYSQL_DATADIR" &&
+    chown mysql:mysql "$MYSQL_DATADIR" && chmod 0750 "$MYSQL_DATADIR"
 
-  if [ "$BACKUP_TOOL" = "mariabackup" ]; then
+  if [ "$BACKUP_TOOL" = "mariabackup" ]; then # mariabackup specific copy-back
     TMP_CNF=$(mktemp)
     {
       echo "[mariabackup]"
@@ -339,8 +353,11 @@ restore)
   else
     $BACKUP_CMD --copy-back --target-dir="$RESTORE_DIR"
   fi
+  COPY_END=$(date +%s)
+  echo "Copy back took $((COPY_END - COPY_START)) seconds" >> "$REPORT_FILE"
+  echo "" >> "$REPORT_FILE"
 
-  chown -R mysql:mysql $MYSQL_DATADIR
+  chown -R mysql:mysql "$MYSQL_DATADIR"
   rm -rf "$RESTORE_DIR"
 
   mysql_service_control start
@@ -351,6 +368,11 @@ restore)
     echo "❌ MySQL failed. Check logs." >&2
     exit 1
   fi
+  END_TIME=$(date +%s)
+  echo "Total restore time: $((END_TIME - START_TIME)) seconds" >> "$REPORT_FILE"
+  
+  [ "$OPT_REPORT" -eq 1 ] && generate_report
+  rm -f "$REPORT_FILE"
   ;;
 
 ##############################################################################
@@ -363,6 +385,11 @@ restore-chain)
 
   # Check for Galera cluster and warn user
   check_galera_cluster
+
+  # Report variables
+  START_TIME=$(date +%s)
+  REPORT_FILE="/tmp/restore_report_$$"
+  echo "Restore chain started on $(date)" > "$REPORT_FILE"
 
   TS=$(echo "$FULL_BACKUP" | grep -o '[0-9]*$')
   [ -n "$TS" ] || { echo "Cannot extract timestamp from backup name." >&2; exit 1; }
@@ -386,8 +413,9 @@ restore-chain)
 
   INC_COUNT=$(wc -l < "$TMP_INCS")
   echo "Found full backup: $FULL_BACKUP"
-  echo "Found $INC_COUNT incrementals in chain"
+  echo "Found $INC_COUNT incrementals in chain" | tee -a "$REPORT_FILE"
 
+  INCREMENTAL_LIST=""
   # If target incremental specified, validate and filter the list
   if [ -n "$TARGET_INC" ]; then
     if ! grep -q "^$TARGET_INC$" "$TMP_INCS"; then
@@ -410,7 +438,14 @@ restore-chain)
     
     mv "$TMP_FILTERED" "$TMP_INCS"
     FILTERED_COUNT=$(wc -l < "$TMP_INCS")
-    echo "Restoring up to: $TARGET_INC ($FILTERED_COUNT incrementals)"
+    echo "Restoring up to: $TARGET_INC ($FILTERED_COUNT incrementals)" | tee -a "$REPORT_FILE"
+  fi
+
+  # Collect incremental names for report
+  INCREMENTAL_LIST=$(cat "$TMP_INCS" | tr '\n' ' ')
+  if [ -n "$INCREMENTAL_LIST" ]; then
+    echo "Incrementals restored: $INCREMENTAL_LIST" >> "$REPORT_FILE"
+    echo "Number of incrementals: $INC_COUNT" >> "$REPORT_FILE"
   fi
 
   if [ "$OPT_DRY_RUN" -eq 1 ]; then
@@ -460,17 +495,25 @@ restore-chain)
   fi
 
   # Create restore directory
+  echo "Downloading full backup..." | tee -a "$REPORT_FILE"
+  FULL_DOWNLOAD_START=$(date +%s)
   mkdir -p "$RESTORE_DIR"
 
   # Download/copy full backup
-  echo "Downloading full backup..."
   if [ "$FULL_SRC_TYPE" = "local" ]; then
     cp -r "$FULL_SRC"/. "$RESTORE_DIR"
+    FULL_BACKUP_SIZE=$(du -sh "$FULL_SRC" | awk '{print $1}')
   else
     mc mirror --overwrite --remove "$FULL_SRC" "$RESTORE_DIR"
+    FULL_BACKUP_SIZE=$(mc du "$FULL_SRC" | awk '{print $1}')
   fi
+  FULL_DOWNLOAD_END=$(date +%s)
+  echo "Full backup size: $FULL_BACKUP_SIZE" >> "$REPORT_FILE"
+  echo "Full backup download took $((FULL_DOWNLOAD_END - FULL_DOWNLOAD_START)) seconds" >> "$REPORT_FILE"
+  echo "" >> "$REPORT_FILE"
 
   # Prepare full backup first without applying logs
+  PREPARE_START=$(date +%s)
   echo "Preparing full backup without applying logs..."
   prepare_backup "$RESTORE_DIR" 0
 
@@ -478,7 +521,9 @@ restore-chain)
   INC_NUM=1
   while IFS= read -r INC_NAME || [ -n "$INC_NAME" ]; do
     [ -z "$INC_NAME" ] && continue
-    
+    INC_APPLY_START=$(date +%s)
+
+    echo "------------------------------------------------------------------------------" >> "$REPORT_FILE"
     echo "Applying incremental $INC_NUM: $INC_NAME"
     INC_DIR="$RESTORE_DIR.inc$INC_NUM"
     mkdir -p "$INC_DIR"
@@ -488,11 +533,15 @@ restore-chain)
       if ! cp -r "$CFG_LOCAL_BACKUP_DIR/$INC_NAME"/. "$INC_DIR"; then
         echo "ERROR: Failed to copy incremental $INC_NAME" >&2
         exit 1
+      else
+        INC_SIZE=$(du -sh "$CFG_LOCAL_BACKUP_DIR/$INC_NAME" | awk '{print $1}')
       fi
     else
       if ! mc mirror --overwrite --remove "$CFG_MC_BUCKET_PATH/$INC_NAME" "$INC_DIR"; then
         echo "ERROR: Failed to download incremental $INC_NAME" >&2
         exit 1
+      else
+        INC_SIZE=$(mc du "$CFG_MC_BUCKET_PATH/$INC_NAME" | awk '{print $1}')
       fi
     fi
     
@@ -560,11 +609,16 @@ restore-chain)
     
     # Clean up incremental directory
     rm -rf "$INC_DIR"
+    INC_APPLY_END=$(date +%s)
+    echo "Incremental $INC_NUM size: $INC_SIZE" >> "$REPORT_FILE"
+    echo "Applying incremental $INC_NUM took $((INC_APPLY_END - INC_APPLY_START)) seconds" >> "$REPORT_FILE"
     INC_NUM=$((INC_NUM + 1))
   done < "$TMP_INCS"
 
+  PREPARE_END=$(date +%s)
+  echo "------------------------------------------------------------------------------" >> "$REPORT_FILE"
   # Final prepare with redo logs
-  echo "Final preparation with redo logs..."
+  echo "Final preparation with redo logs..." | tee -a "$REPORT_FILE"
   if [ "$BACKUP_TOOL" = "mariabackup" ]; then
     TMP_CNF=$(mktemp)
     {
@@ -577,9 +631,12 @@ restore-chain)
   else
     $BACKUP_CMD --prepare --target-dir="$RESTORE_DIR"
   fi
+  echo "Preparation took $((PREPARE_END - PREPARE_START)) seconds" >> "$REPORT_FILE"
+  echo "" >> "$REPORT_FILE"
 
+  echo "Copying back data..." | tee -a "$REPORT_FILE"
   # Stop MySQL and restore
-  echo "Stopping MySQL and restoring data..."
+  COPY_START=$(date +%s)
   if mysql_service_control status; then
     echo "Stopping MySQL service..."
     mysql_service_control stop
@@ -587,8 +644,8 @@ restore-chain)
     echo "MySQL service already stopped."
   fi
   
-  rm -rf $MYSQL_DATADIR/* && mkdir -p $MYSQL_DATADIR &&
-    chown mysql:mysql $MYSQL_DATADIR && chmod 0750 $MYSQL_DATADIR
+  rm -rf "$MYSQL_DATADIR"/* && mkdir -p "$MYSQL_DATADIR" &&
+    chown mysql:mysql "$MYSQL_DATADIR" && chmod 0750 "$MYSQL_DATADIR"
 
   if [ "$BACKUP_TOOL" = "mariabackup" ]; then
     TMP_CNF=$(mktemp)
@@ -602,8 +659,10 @@ restore-chain)
   else
     $BACKUP_CMD --copy-back --target-dir="$RESTORE_DIR"
   fi
+  COPY_END=$(date +%s)
+  echo "Copy back took $((COPY_END - COPY_START)) seconds" >> "$REPORT_FILE"
 
-  chown -R mysql:mysql $MYSQL_DATADIR
+  chown -R mysql:mysql "$MYSQL_DATADIR"
   rm -rf "$RESTORE_DIR"
   rm -f "$TMP_INCS"
 
@@ -615,22 +674,26 @@ restore-chain)
     echo "❌ MySQL failed. Check logs." >&2
     exit 1
   fi
+  END_TIME=$(date +%s)
+  echo "Total restore time: $((END_TIME - START_TIME)) seconds" >> "$REPORT_FILE"
+
+  [ "$OPT_REPORT" -eq 1 ] && generate_report
+  rm -f "$REPORT_FILE"
   ;;
 
 ##############################################################################
-analyze-chains) analyze_backup_chains ;;
 list)           list_backups ;;
 *)
   cat <<'EOF'
-Usage: xtrabackup-restore.sh {restore|restore-chain|list|analyze-chains} [OPTIONS]
+Usage: xtrabackup-restore.sh {restore|restore-chain|list} [OPTIONS]
 
 RESTORE OPERATIONS:
   restore <backup>             Restore a single full backup
   restore-chain <full> [target_inc] Restore full backup + incrementals up to target
 
 ANALYSIS:  
+  --report                     Generate a detailed report at the end
   list                         List local & S3 backups
-  analyze-chains               Show backup chains / orphans
 
 Common options:
   --dry-run                    Print every command, do nothing
