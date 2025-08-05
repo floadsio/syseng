@@ -4,7 +4,7 @@
 ##############################################################################
 # Universal MySQL / MariaDB XtraBackup → S3 Script  (pure POSIX /bin/sh)
 # BACKUP OPERATIONS ONLY - Based on working version with sync improvements
-# Maintainer : you            Last update : 20 Jul 2025
+# Maintainer : floads            Last update : 20 Jul 2025
 ##############################################################################
 
 set -e
