@@ -71,6 +71,188 @@ detect_os() {
 }
 
 ##############################################################################
+send_slack_notification() {
+  MESSAGE_TYPE=$1
+  DETAILS=${2:-""}
+  
+  # Check if Slack webhook is configured
+  [ -z "$CFG_SLACK_WEBHOOK" ] && return 0
+  
+  # Get hostname for context
+  HOSTNAME=$(hostname -f 2>/dev/null || hostname)
+  BACKUP_HOST=$(echo "$CFG_MC_BUCKET_PATH" | sed 's|.*//||' | cut -d'/' -f1)
+  BUCKET_PATH=$(echo "$CFG_MC_BUCKET_PATH" | sed 's|dcx@||')
+  BACKUP_NAME=$(echo $RESTORE_ARGUMENTS | awk '{print $1}')
+  
+  case "$MESSAGE_TYPE" in
+    start)
+      # For restore-chain, get incremental count
+      if [ "$OPT_RESTORE_TYPE" = "restore-chain" ]; then
+        FULL_BACKUP=$(echo "$RESTORE_ARGUMENTS" | awk '{print $1}')
+        TS=$(echo "$FULL_BACKUP" | grep -o '[0-9]*$')
+        
+        # Determine if the full backup is local or remote to count incrementals
+        if [ -d "$CFG_LOCAL_BACKUP_DIR/$FULL_BACKUP" ]; then
+          INC_COUNT=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "*_inc_base-${TS}_*" | wc -l)
+        else
+          INC_COUNT=$(mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | sed 's:/$::' | grep "_inc_base-${TS}_" | wc -l)
+        fi
+        
+        MESSAGE="Restoring full backup $BACKUP_NAME with $INC_COUNT incrementals."
+      else
+        MESSAGE="Starting full backup restore of $BACKUP_NAME."
+      fi
+
+      PAYLOAD=$(cat <<EOF
+{
+  "text": "⏳ Database Restore Started",
+  "attachments": [
+    {
+      "color": "warning",
+      "fields": [
+        {
+          "title": "Server",
+          "value": "$HOSTNAME",
+          "short": true
+        },
+        {
+          "title": "Backup",
+          "value": "$BACKUP_NAME",
+          "short": true
+        },
+        {
+          "title": "Backup Path",
+          "value": "$BUCKET_PATH",
+          "short": false
+        },
+        {
+          "title": "Operation",
+          "value": "$OPT_RESTORE_TYPE",
+          "short": true
+        },
+        {
+          "title": "Message",
+          "value": "$MESSAGE",
+          "short": false
+        },
+        {
+          "title": "Started",
+          "value": "$(date '+%Y-%m-%d %H:%M:%S UTC')",
+          "short": false
+        }
+      ]
+    }
+  ]
+}
+EOF
+)
+      ;;
+    success)
+      # Parse report details for summary
+      TOTAL_TIME=$(echo "$DETAILS" | grep "Total restore time:" | awk '{print $4}' | head -1)
+      BACKUP_SIZE=$(echo "$DETAILS" | grep "backup size:" | awk '{print $4}' | head -1)
+      INC_COUNT=$(echo "$DETAILS" | grep "Number of incrementals:" | awk '{print $4}' | head -1)
+      
+      # Convert seconds to human readable
+      HOURS=$((TOTAL_TIME / 3600))
+      MINUTES=$(((TOTAL_TIME % 3600) / 60))
+      SECONDS_REMAINDER=$((TOTAL_TIME % 60))
+      TIME_HUMAN="${HOURS}h ${MINUTES}m ${SECONDS_REMAINDER}s"
+      
+      PAYLOAD=$(cat <<EOF
+{
+  "text": "✅ Database Restore Completed Successfully",
+  "attachments": [
+    {
+      "color": "good",
+      "fields": [
+        {
+          "title": "Server",
+          "value": "$HOSTNAME",
+          "short": true
+        },
+        {
+          "title": "Backup Restored",
+          "value": "$BACKUP_NAME",
+          "short": true
+        },
+        {
+          "title": "Backup Path",
+          "value": "$BUCKET_PATH",
+          "short": false
+        },
+        {
+          "title": "Source Host",
+          "value": "$BACKUP_HOST",
+          "short": true
+        },
+        {
+          "title": "Duration",
+          "value": "$TIME_HUMAN",
+          "short": true
+        },
+        {
+          "title": "Data Size",
+          "value": "$BACKUP_SIZE",
+          "short": true
+        },
+        {
+          "title": "Incrementals Applied",
+          "value": "$INC_COUNT",
+          "short": true
+        },
+        {
+          "title": "Completed",
+          "value": "$(date '+%Y-%m-%d %H:%M:%S UTC')",
+          "short": false
+        }
+      ]
+    }
+  ]
+}
+EOF
+)
+      ;;
+    error)
+      PAYLOAD=$(cat <<EOF
+{
+  "text": "❌ Database Restore Failed",
+  "attachments": [
+    {
+      "color": "danger",
+      "fields": [
+        {
+          "title": "Server",
+          "value": "$HOSTNAME",
+          "short": true
+        },
+        {
+          "title": "Error",
+          "value": "$DETAILS",
+          "short": false
+        },
+        {
+          "title": "Failed at",
+          "value": "$(date '+%Y-%m-%d %H:%M:%S UTC')",
+          "short": true
+        }
+      ]
+    }
+  ]
+}
+EOF
+)
+      ;;
+  esac
+  
+  # Send to Slack (suppress output unless error)
+  if ! curl -s -X POST -H 'Content-type: application/json' \
+       --data "$PAYLOAD" "$CFG_SLACK_WEBHOOK" >/dev/null; then
+    echo "Warning: Failed to send Slack notification" >&2
+  fi
+}
+
+##############################################################################
 mysql_service_control() {
   ACTION=$1
   
@@ -267,6 +449,8 @@ restore)
   REPORT_FILE="/tmp/restore_report_$$"
   echo "Restore started on $(date)" > "$REPORT_FILE"
 
+  send_slack_notification "start"
+
   RESTORE_DIR=${OPT_RESTORE_DIR:-/var/tmp/restore_$$}
 
   if [ -d "$CFG_LOCAL_BACKUP_DIR/$FULL_BACKUP" ]; then
@@ -307,12 +491,12 @@ restore)
 
   echo "Downloading backup..." | tee -a "$REPORT_FILE"
   DOWNLOAD_START=$(date +%s)
-  mkdir -p "$RESTORE_DIR"
+  mkdir -p "$RESTORE_DIR" || { send_slack_notification "error" "Failed to create directory $RESTORE_DIR"; exit 1; }
   if [ "$SRC_TYPE" = local ]; then
-    cp -r "$SRC"/. "$RESTORE_DIR"
+    cp -r "$SRC"/. "$RESTORE_DIR" || { send_slack_notification "error" "Failed to copy backup from local source"; exit 1; }
     BACKUP_SIZE=$(du -sh "$SRC" | awk '{print $1}')
   else
-    mc mirror --overwrite --remove "$SRC" "$RESTORE_DIR"
+    mc mirror --overwrite --remove "$SRC" "$RESTORE_DIR" || { send_slack_notification "error" "Failed to download backup from S3"; exit 1; }
     BACKUP_SIZE=$(mc du "$SRC" | awk '{print $1}')
   fi
   DOWNLOAD_END=$(date +%s)
@@ -322,7 +506,7 @@ restore)
 
   echo "Preparing backup..." | tee -a "$REPORT_FILE"
   PREPARE_START=$(date +%s)
-  prepare_backup "$RESTORE_DIR" 1
+  prepare_backup "$RESTORE_DIR" 1 || { send_slack_notification "error" "Failed to prepare backup"; exit 1; }
   PREPARE_END=$(date +%s)
   echo "Preparation took $((PREPARE_END - PREPARE_START)) seconds" >> "$REPORT_FILE"
   echo "" >> "$REPORT_FILE"
@@ -330,7 +514,7 @@ restore)
   # Check if MySQL is running before trying to stop it
   if mysql_service_control status; then
     echo "Stopping MySQL service..."
-    mysql_service_control stop
+    mysql_service_control stop || { send_slack_notification "error" "Failed to stop MySQL service"; exit 1; }
   else
     echo "MySQL service already stopped."
   fi
@@ -339,7 +523,7 @@ restore)
   COPY_START=$(date +%s)
   
   rm -rf "$MYSQL_DATADIR"/* && mkdir -p "$MYSQL_DATADIR" &&
-    chown mysql:mysql "$MYSQL_DATADIR" && chmod 0750 "$MYSQL_DATADIR"
+    chown mysql:mysql "$MYSQL_DATADIR" && chmod 0750 "$MYSQL_DATADIR" || { send_slack_notification "error" "Failed to clear or prepare datadir"; exit 1; }
 
   if [ "$BACKUP_TOOL" = "mariabackup" ]; then # mariabackup specific copy-back
     TMP_CNF=$(mktemp)
@@ -348,30 +532,33 @@ restore)
       echo "user=root"
       grep '^password' /root/.my.cnf 2>/dev/null || true
     } >"$TMP_CNF"
-    $BACKUP_CMD --defaults-file="$TMP_CNF" --copy-back --target-dir="$RESTORE_DIR"
+    $BACKUP_CMD --defaults-file="$TMP_CNF" --copy-back --target-dir="$RESTORE_DIR" || { send_slack_notification "error" "Failed to copy back data with mariabackup"; exit 1; }
     rm -f "$TMP_CNF"
   else
-    $BACKUP_CMD --copy-back --target-dir="$RESTORE_DIR"
+    $BACKUP_CMD --copy-back --target-dir="$RESTORE_DIR" || { send_slack_notification "error" "Failed to copy back data with xtrabackup"; exit 1; }
   fi
   COPY_END=$(date +%s)
   echo "Copy back took $((COPY_END - COPY_START)) seconds" >> "$REPORT_FILE"
   echo "" >> "$REPORT_FILE"
 
-  chown -R mysql:mysql "$MYSQL_DATADIR"
+  chown -R mysql:mysql "$MYSQL_DATADIR" || { send_slack_notification "error" "Failed to chown datadir"; exit 1; }
   rm -rf "$RESTORE_DIR"
 
-  mysql_service_control start
+  mysql_service_control start || { send_slack_notification "error" "Failed to start MySQL service"; exit 1; }
   sleep 2
   if mysql_service_control status; then
     echo "✅ Restore complete."
   else
     echo "❌ MySQL failed. Check logs." >&2
+    send_slack_notification "error" "MySQL service failed to start after restore."
     exit 1
   fi
   END_TIME=$(date +%s)
   echo "Total restore time: $((END_TIME - START_TIME)) seconds" >> "$REPORT_FILE"
   
   [ "$OPT_REPORT" -eq 1 ] && generate_report
+  REPORT_CONTENT=$(cat "$REPORT_FILE")
+  send_slack_notification "success" "$REPORT_CONTENT"
   rm -f "$REPORT_FILE"
   ;;
 
@@ -390,6 +577,8 @@ restore-chain)
   START_TIME=$(date +%s)
   REPORT_FILE="/tmp/restore_report_$$"
   echo "Restore chain started on $(date)" > "$REPORT_FILE"
+
+  send_slack_notification "start"
 
   TS=$(echo "$FULL_BACKUP" | grep -o '[0-9]*$')
   [ -n "$TS" ] || { echo "Cannot extract timestamp from backup name." >&2; exit 1; }
@@ -497,14 +686,14 @@ restore-chain)
   # Create restore directory
   echo "Downloading full backup..." | tee -a "$REPORT_FILE"
   FULL_DOWNLOAD_START=$(date +%s)
-  mkdir -p "$RESTORE_DIR"
+  mkdir -p "$RESTORE_DIR" || { send_slack_notification "error" "Failed to create restore directory"; exit 1; }
 
   # Download/copy full backup
   if [ "$FULL_SRC_TYPE" = "local" ]; then
-    cp -r "$FULL_SRC"/. "$RESTORE_DIR"
+    cp -r "$FULL_SRC"/. "$RESTORE_DIR" || { send_slack_notification "error" "Failed to copy full backup from local source"; exit 1; }
     FULL_BACKUP_SIZE=$(du -sh "$FULL_SRC" | awk '{print $1}')
   else
-    mc mirror --overwrite --remove "$FULL_SRC" "$RESTORE_DIR"
+    mc mirror --overwrite --remove "$FULL_SRC" "$RESTORE_DIR" || { send_slack_notification "error" "Failed to download full backup from S3"; exit 1; }
     FULL_BACKUP_SIZE=$(mc du "$FULL_SRC" | awk '{print $1}')
   fi
   FULL_DOWNLOAD_END=$(date +%s)
@@ -515,7 +704,7 @@ restore-chain)
   # Prepare full backup first without applying logs
   PREPARE_START=$(date +%s)
   echo "Preparing full backup without applying logs..."
-  prepare_backup "$RESTORE_DIR" 0
+  prepare_backup "$RESTORE_DIR" 0 || { send_slack_notification "error" "Failed to prepare full backup"; exit 1; }
 
   # Apply incrementals in order
   INC_NUM=1
@@ -526,20 +715,18 @@ restore-chain)
     echo "------------------------------------------------------------------------------" >> "$REPORT_FILE"
     echo "Applying incremental $INC_NUM: $INC_NAME"
     INC_DIR="$RESTORE_DIR.inc$INC_NUM"
-    mkdir -p "$INC_DIR"
+    mkdir -p "$INC_DIR" || { send_slack_notification "error" "Failed to create incremental restore directory"; exit 1; }
     
     # Download/copy incremental
     if [ "$FULL_SRC_TYPE" = "local" ]; then
       if ! cp -r "$CFG_LOCAL_BACKUP_DIR/$INC_NAME"/. "$INC_DIR"; then
-        echo "ERROR: Failed to copy incremental $INC_NAME" >&2
-        exit 1
+        send_slack_notification "error" "Failed to copy incremental $INC_NAME"; exit 1;
       else
         INC_SIZE=$(du -sh "$CFG_LOCAL_BACKUP_DIR/$INC_NAME" | awk '{print $1}')
       fi
     else
       if ! mc mirror --overwrite --remove "$CFG_MC_BUCKET_PATH/$INC_NAME" "$INC_DIR"; then
-        echo "ERROR: Failed to download incremental $INC_NAME" >&2
-        exit 1
+        send_slack_notification "error" "Failed to download incremental $INC_NAME"; exit 1;
       else
         INC_SIZE=$(mc du "$CFG_MC_BUCKET_PATH/$INC_NAME" | awk '{print $1}')
       fi
@@ -561,13 +748,13 @@ restore-chain)
         DECRYPT_OPTIONS="--encrypt-key-file=$CFG_ENCRYPT_KEY_FILE"
       else
         echo "ERROR: encrypted backup but no key." >&2
+        send_slack_notification "error" "Encrypted backup but no key found."
         exit 1
       fi
 
       if [ "$BACKUP_TOOL" != "mariabackup" ]; then
         if ! $BACKUP_CMD --decrypt=AES256 "$DECRYPT_OPTIONS" --target-dir="$INC_DIR"; then
-          echo "ERROR: Failed to decrypt incremental $INC_NAME" >&2
-          exit 1
+          send_slack_notification "error" "Failed to decrypt incremental $INC_NAME"; exit 1;
         fi
         find "$INC_DIR" -name '*.xbcrypt' -type f -delete
       fi
@@ -577,8 +764,7 @@ restore-chain)
     if find "$INC_DIR" \( -name '*.zst' -o -name '*.qp' \) | grep -q .; then
       if [ "$BACKUP_TOOL" != "mariabackup" ]; then
         if ! $BACKUP_CMD --decompress --target-dir="$INC_DIR"; then
-          echo "ERROR: Failed to decompress incremental $INC_NAME" >&2
-          exit 1
+          send_slack_notification "error" "Failed to decompress incremental $INC_NAME"; exit 1;
         fi
         find "$INC_DIR" \( -name '*.zst' -o -name '*.qp' \) -type f -delete
       fi
@@ -595,15 +781,12 @@ restore-chain)
       } >"$TMP_CNF"
       
       if ! $BACKUP_CMD --defaults-file="$TMP_CNF" --prepare --apply-log-only --target-dir="$RESTORE_DIR" --incremental-dir="$INC_DIR"; then
-        echo "ERROR: Failed to apply incremental $INC_NAME" >&2
-        rm -f "$TMP_CNF"
-        exit 1
+        send_slack_notification "error" "Failed to apply incremental $INC_NAME"; rm -f "$TMP_CNF"; exit 1;
       fi
       rm -f "$TMP_CNF"
     else
       if ! $BACKUP_CMD --prepare --apply-log-only --target-dir="$RESTORE_DIR" --incremental-dir="$INC_DIR"; then
-        echo "ERROR: Failed to apply incremental $INC_NAME" >&2
-        exit 1
+        send_slack_notification "error" "Failed to apply incremental $INC_NAME"; exit 1;
       fi
     fi
     
@@ -626,10 +809,10 @@ restore-chain)
       echo "user=root"
       grep '^password' /root/.my.cnf 2>/dev/null
     } >"$TMP_CNF"
-    $BACKUP_CMD --defaults-file="$TMP_CNF" --prepare --target-dir="$RESTORE_DIR"
+    $BACKUP_CMD --defaults-file="$TMP_CNF" --prepare --target-dir="$RESTORE_DIR" || { send_slack_notification "error" "Final preparation failed for mariabackup"; rm -f "$TMP_CNF"; exit 1; }
     rm -f "$TMP_CNF"
   else
-    $BACKUP_CMD --prepare --target-dir="$RESTORE_DIR"
+    $BACKUP_CMD --prepare --target-dir="$RESTORE_DIR" || { send_slack_notification "error" "Final preparation failed for xtrabackup"; exit 1; }
   fi
   echo "Preparation took $((PREPARE_END - PREPARE_START)) seconds" >> "$REPORT_FILE"
   echo "" >> "$REPORT_FILE"
@@ -639,13 +822,13 @@ restore-chain)
   COPY_START=$(date +%s)
   if mysql_service_control status; then
     echo "Stopping MySQL service..."
-    mysql_service_control stop
+    mysql_service_control stop || { send_slack_notification "error" "Failed to stop MySQL service"; exit 1; }
   else
     echo "MySQL service already stopped."
   fi
   
   rm -rf "$MYSQL_DATADIR"/* && mkdir -p "$MYSQL_DATADIR" &&
-    chown mysql:mysql "$MYSQL_DATADIR" && chmod 0750 "$MYSQL_DATADIR"
+    chown mysql:mysql "$MYSQL_DATADIR" && chmod 0750 "$MYSQL_DATADIR" || { send_slack_notification "error" "Failed to clear or prepare datadir"; exit 1; }
 
   if [ "$BACKUP_TOOL" = "mariabackup" ]; then
     TMP_CNF=$(mktemp)
@@ -654,30 +837,33 @@ restore-chain)
       echo "user=root"
       grep '^password' /root/.my.cnf 2>/dev/null
     } >"$TMP_CNF"
-    $BACKUP_CMD --defaults-file="$TMP_CNF" --copy-back --target-dir="$RESTORE_DIR"
+    $BACKUP_CMD --defaults-file="$TMP_CNF" --copy-back --target-dir="$RESTORE_DIR" || { send_slack_notification "error" "Failed to copy back data with mariabackup"; rm -f "$TMP_CNF"; exit 1; }
     rm -f "$TMP_CNF"
   else
-    $BACKUP_CMD --copy-back --target-dir="$RESTORE_DIR"
+    $BACKUP_CMD --copy-back --target-dir="$RESTORE_DIR" || { send_slack_notification "error" "Failed to copy back data with xtrabackup"; exit 1; }
   fi
   COPY_END=$(date +%s)
   echo "Copy back took $((COPY_END - COPY_START)) seconds" >> "$REPORT_FILE"
 
-  chown -R mysql:mysql "$MYSQL_DATADIR"
+  chown -R mysql:mysql "$MYSQL_DATADIR" || { send_slack_notification "error" "Failed to chown datadir"; exit 1; }
   rm -rf "$RESTORE_DIR"
   rm -f "$TMP_INCS"
 
-  mysql_service_control start
+  mysql_service_control start || { send_slack_notification "error" "Failed to start MySQL service"; exit 1; }
   sleep 2
   if mysql_service_control status; then
     echo "✅ Chain restore complete."
   else
     echo "❌ MySQL failed. Check logs." >&2
+    send_slack_notification "error" "MySQL service failed to start after restore."
     exit 1
   fi
   END_TIME=$(date +%s)
   echo "Total restore time: $((END_TIME - START_TIME)) seconds" >> "$REPORT_FILE"
 
   [ "$OPT_REPORT" -eq 1 ] && generate_report
+  REPORT_CONTENT=$(cat "$REPORT_FILE")
+  send_slack_notification "success" "$REPORT_CONTENT"
   rm -f "$REPORT_FILE"
   ;;
 
