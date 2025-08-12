@@ -2,37 +2,59 @@
 # shellcheck shell=sh
 
 ##############################################################################
-# Universal MySQL / MariaDB XtraBackup → S3 Script  (pure POSIX /bin/sh)
+# Universal MySQL / MariaDB XtraBackup → S3 Script (pure POSIX /bin/sh)
 # BACKUP OPERATIONS ONLY - Based on working version with sync improvements
-# Maintainer : floads            Last update : 20 Jul 2025
+# Maintainer : you            Last update : 20 Jul 2025
 ##############################################################################
 
 set -e
 
 # ---------------------------------------------------------------------------
-# Lock file to prevent concurrent runs
+# Static placeholders
 # ---------------------------------------------------------------------------
-LOCK_FILE="/tmp/xtrabackup-s3.lock"
-if [ -f "$LOCK_FILE" ]; then
-  echo "ERROR: Another backup is already running (lock file exists: $LOCK_FILE)." >&2
-  exit 1
-fi
-trap 'rm -f "$LOCK_FILE"' EXIT
-touch "$LOCK_FILE"
-
-# ---------------------------------------------------------------------------
-# Static placeholders (kept for compatibility / hooks)
-# ---------------------------------------------------------------------------
-# shellcheck disable=SC2034
 CFG_EXTRA_LSN_DIR="/var/backups/mysql_lsn"
-# shellcheck disable=SC2034
 CFG_HOSTNAME=$(hostname)
 CFG_DATE=$(date +%Y-%m-%d_%H-%M-%S)
 CFG_TIMESTAMP=$(date +%s)
-# shellcheck disable=SC2034
-CFG_INCREMENTAL=""
+BACKUP_TOOL="" GALERA_OPTIONS=""
 
-BACKUP_TOOL="" BACKUP_CMD="" GALERA_OPTIONS=""
+# Lock file for preventing concurrent backups
+LOCK_FILE="/var/run/xtrabackup-s3.lock"
+LOCK_ACQUIRED=0
+
+# Cleanup function to remove lock on exit
+cleanup_on_exit() {
+  if [ "$LOCK_ACQUIRED" -eq 1 ]; then
+    rm -f "$LOCK_FILE"
+  fi
+}
+trap cleanup_on_exit EXIT INT TERM
+
+# Function to acquire lock
+acquire_lock() {
+  if [ -f "$LOCK_FILE" ]; then
+    # Check for stale lock unless it's a dry run
+    if [ "$OPT_DRY_RUN" -eq 0 ] && [ -r "$LOCK_FILE" ]; then
+      LOCK_PID=$(cat "$LOCK_FILE" | head -1 | awk '{print $2}')
+      if [ -n "$LOCK_PID" ] && kill -0 "$LOCK_PID" 2>/dev/null; then
+        echo "ERROR: Another backup is already running (PID: $LOCK_PID)"
+        echo "Lock file: $LOCK_FILE"
+        exit 1
+      else
+        echo "WARNING: Stale lock file found, removing..."
+        rm -f "$LOCK_FILE"
+      fi
+    elif [ "$OPT_DRY_RUN" -eq 1 ]; then
+      echo "WARNING: Lock file exists - another backup may be running"
+      echo "Lock file: $LOCK_FILE"
+    fi
+  fi
+  
+  if [ "$OPT_DRY_RUN" -eq 0 ]; then
+    echo "PID: $$ DATE: $(date) TYPE: $OPT_BACKUP_TYPE" > "$LOCK_FILE"
+    LOCK_ACQUIRED=1
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # Load user configuration (~/.xtrabackup-s3.conf)
@@ -43,8 +65,7 @@ CONFIG_FILE="$HOME/.xtrabackup-s3.conf"
 . "$CONFIG_FILE"
 
 # mandatory settings
-if [ -z "$CFG_MC_BUCKET_PATH" ] || [ -z "$CFG_CUTOFF_DAYS" ] || \
-   [ -z "$CFG_LOCAL_BACKUP_DIR" ]; then
+if [ -z "$CFG_MC_BUCKET_PATH" ] || [ -z "$CFG_CUTOFF_DAYS" ] || [ -z "$CFG_LOCAL_BACKUP_DIR" ]; then
   echo "ERROR: CFG_MC_BUCKET_PATH, CFG_CUTOFF_DAYS and CFG_LOCAL_BACKUP_DIR are mandatory." >&2
   exit 1
 fi
@@ -56,15 +77,27 @@ OPT_BACKUP_TYPE=${1:-}
 OPT_DRY_RUN=0 OPT_CLEANUP=0 OPT_NO_SYNC=0 OPT_LOCAL_ONLY=0
 BACKUP_ARGUMENTS=""
 
+# Lock file for preventing concurrent backups
+LOCK_FILE="/var/run/xtrabackup-s3.lock"
+LOCK_ACQUIRED=0
+
+# Cleanup function to remove lock on exit
+cleanup_on_exit() {
+  if [ "$LOCK_ACQUIRED" -eq 1 ]; then
+    rm -f "$LOCK_FILE"
+  fi
+}
+trap cleanup_on_exit EXIT INT TERM
+
 if [ $# -gt 0 ]; then
   shift
   while [ "$1" ]; do
     case "$1" in
-      --dry-run)       OPT_DRY_RUN=1 ;;
-      --cleanup)       OPT_CLEANUP=1 ;;
-      --no-sync)       OPT_NO_SYNC=1 ;;
-      --local-only)    OPT_LOCAL_ONLY=1 ;;
-      *)               BACKUP_ARGUMENTS="$BACKUP_ARGUMENTS $1" ;;
+      --dry-run)    OPT_DRY_RUN=1 ;;
+      --cleanup)    OPT_CLEANUP=1 ;;
+      --no-sync)    OPT_NO_SYNC=1 ;;
+      --local-only) OPT_LOCAL_ONLY=1 ;;
+      *)            BACKUP_ARGUMENTS="$BACKUP_ARGUMENTS $1" ;;
     esac
     shift
   done
@@ -75,15 +108,11 @@ detect_backup_tool() {
   echo "Detecting database type and backup tool..."
   
   if command -v mariabackup >/dev/null 2>&1; then
-    BACKUP_TOOL=mariabackup BACKUP_CMD=mariabackup
+    BACKUP_TOOL=mariabackup
     echo "MariaDB detected - using mariabackup"
     
-    if mysql --defaults-file=/root/.my.cnf \
-         -e "SHOW STATUS LIKE 'wsrep_cluster_size'" 2>/dev/null |
-         grep -q wsrep_cluster_size; then
-      CLUSTER_SIZE=$(mysql --defaults-file=/root/.my.cnf \
-        -e "SHOW STATUS LIKE 'wsrep_cluster_size'" 2>/dev/null |
-        awk '/wsrep_cluster_size/ {print $2}')
+    if mysql --defaults-file=/root/.my.cnf -e "SHOW STATUS LIKE 'wsrep_cluster_size'" 2>/dev/null | grep -q wsrep_cluster_size; then
+      CLUSTER_SIZE=$(mysql --defaults-file=/root/.my.cnf -e "SHOW STATUS LIKE 'wsrep_cluster_size'" 2>/dev/null | awk '/wsrep_cluster_size/ {print $2}')
       if [ -n "$CLUSTER_SIZE" ] && [ "$CLUSTER_SIZE" != "NULL" ] && [ "$CLUSTER_SIZE" -gt 0 ]; then
         GALERA_OPTIONS="--galera-info"
         echo "Galera cluster detected (cluster size: $CLUSTER_SIZE) - adding --galera-info option"
@@ -94,14 +123,14 @@ detect_backup_tool() {
       echo "Standalone MariaDB instance detected"
     fi
   elif command -v xtrabackup >/dev/null 2>&1; then
-    BACKUP_TOOL=xtrabackup BACKUP_CMD=xtrabackup
+    BACKUP_TOOL=xtrabackup
     echo "MySQL/Percona detected - using xtrabackup"
   else
     echo "ERROR: install xtrabackup or mariabackup." >&2
     exit 1
   fi
   
-  echo "Using backup tool: $BACKUP_CMD $GALERA_OPTIONS"
+  echo "Using backup tool: $BACKUP_TOOL $GALERA_OPTIONS"
   echo ""
 }
 
@@ -133,43 +162,23 @@ sync_to_s3() {
 
 ##############################################################################
 cleanup_old_backups() {
-  echo "Pruning old chains in S3 with chain integrity protection…"
+  echo "Pruning old chains in S3 …"
   CUTOFF_DATE=$(date -d "$CFG_CUTOFF_DAYS days ago" +%Y-%m-%d)
   CUTOFF_NUM=$(echo "$CUTOFF_DATE" | tr -d '-')
 
   TMP=$(mktemp)
-  TMP_CHAINS=$(mktemp)
   mc ls "$CFG_MC_BUCKET_PATH" | awk '{print $NF}' | sed 's:/$::' | sort >"$TMP"
 
-  # Build chain analysis: full_backup -> newest_incremental_date
   grep "_full_" "$TMP" | while read -r FULL; do
     [ -z "$FULL" ] && continue
-    FULL_TS=$(echo "$FULL" | grep -o '[0-9]*$')
     FULL_DATE=$(echo "$FULL" | cut -d_ -f1)
-    
-    # Find newest incremental in this chain
-    NEWEST_INC_DATE="$FULL_DATE"
-    grep "_inc_base-${FULL_TS}_" "$TMP" | while read -r INC; do
-      [ -z "$INC" ] && continue
-      INC_DATE=$(echo "$INC" | cut -d_ -f1)
-      if [ "$INC_DATE" \> "$NEWEST_INC_DATE" ]; then
-        NEWEST_INC_DATE="$INC_DATE"
-      fi
-    done
-    
-    echo "$FULL|$NEWEST_INC_DATE|$FULL_TS" >> "$TMP_CHAINS"
-  done
+    FULL_NUM=$(echo "$FULL_DATE" | tr -d '-')
+    FULL_TS=$(echo "$FULL" | grep -o '[0-9]*$')
 
-  # Only delete chains where NEWEST backup (full or incremental) is older than cutoff
-  while IFS='|' read -r FULL NEWEST_DATE FULL_TS; do
-    [ -z "$FULL" ] && continue
-    NEWEST_NUM=$(echo "$NEWEST_DATE" | tr -d '-')
-    
-    if [ "$NEWEST_NUM" -lt "$CUTOFF_NUM" ]; then
-      echo "  ✅ Removing chain rooted at $FULL (newest backup: $NEWEST_DATE)"
-      
-      # Delete all incrementals in chain
-      grep "_inc_base-${FULL_TS}_" "$TMP" | while read -r INC; do
+    if [ "$FULL_NUM" -lt "$CUTOFF_NUM" ]; then
+      echo "  Removing chain rooted at $FULL"
+      grep "_inc_base-${FULL_TS}_" "$TMP" |
+      while read -r INC; do
         [ -z "$INC" ] && continue
         if [ "$OPT_DRY_RUN" -eq 1 ]; then
           echo "    [DRY-RUN] mc rb --force \"$CFG_MC_BUCKET_PATH/$INC\""
@@ -177,19 +186,14 @@ cleanup_old_backups() {
           mc rb --force "$CFG_MC_BUCKET_PATH/$INC"
         fi
       done
-      
-      # Delete full backup
       if [ "$OPT_DRY_RUN" -eq 1 ]; then
         echo "    [DRY-RUN] mc rb --force \"$CFG_MC_BUCKET_PATH/$FULL\""
       else
         mc rb --force "$CFG_MC_BUCKET_PATH/$FULL"
       fi
-    else
-      echo "  🔒 Preserving chain rooted at $FULL (newest backup: $NEWEST_DATE, within retention)"
     fi
-  done < "$TMP_CHAINS"
-  
-  rm -f "$TMP" "$TMP_CHAINS"
+  done
+  rm -f "$TMP"
 }
 
 ##############################################################################
@@ -246,145 +250,84 @@ list_backups() {
 case "$OPT_BACKUP_TYPE" in
 ##############################################################################
 full|inc)
+  acquire_lock
   detect_backup_tool
   mkdir -p "$CFG_LOCAL_BACKUP_DIR"
 
-  ########################################################################
-  # ---------------------- Incremental backup ---------------------------
-  ########################################################################
+  # Determine backup type and parameters
+  BACKUP_OPTIONS=""
+  LOCAL_BACKUP_DIR=""
+  
   if [ "$OPT_BACKUP_TYPE" = "inc" ]; then
-    # Find the most recent full backup
-    LATEST_FULL_BACKUP=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "*_full_*" | sort -r | head -n 1)
-    if [ -z "$LATEST_FULL_BACKUP" ]; then
-        echo "No full backup found in $CFG_LOCAL_BACKUP_DIR. Please run a full backup first."
+    LATEST_BACKUP=""
+    for backup in $(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "20*" | sort -r); do
+        if [ -f "$backup/xtrabackup_checkpoints" ]; then
+            LATEST_BACKUP="$backup"
+            break
+        fi
+    done
+    
+    if [ -z "$LATEST_BACKUP" ]; then
+        echo "No valid backup found in $CFG_LOCAL_BACKUP_DIR with xtrabackup_checkpoints file."
+        echo "Please run a full backup first or sync from S3."
         exit 1
     fi
-
-    # Get the full backup timestamp for chain tracking
-    FULL_BACKUP_NAME=$(basename "$LATEST_FULL_BACKUP")
-    BASE_TIMESTAMP=$(echo "$FULL_BACKUP_NAME" | grep -o '[0-9]*$')
-
-    # Check if there are any incrementals for this full backup
-    LATEST_INC_FOR_FULL=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "*_inc_base-${BASE_TIMESTAMP}_*" | sort -r | head -n 1)
-
-    if [ -n "$LATEST_INC_FOR_FULL" ]; then
-        # Use the latest incremental as base (chain incrementals)
-        LATEST_BACKUP="$LATEST_INC_FOR_FULL"
-        echo "Using latest incremental as base: $(basename "$LATEST_BACKUP")"
+    
+    LATEST_BACKUP_NAME=$(basename "$LATEST_BACKUP")
+    if echo "$LATEST_BACKUP_NAME" | grep -q "_full_"; then
+        BASE_TIMESTAMP=$(echo "$LATEST_BACKUP_NAME" | grep -o '[0-9]*$')
     else
-        # Use the full backup as base (first incremental in chain)
-        LATEST_BACKUP="$LATEST_FULL_BACKUP"
-        echo "Using full backup as base: $(basename "$LATEST_BACKUP")"
+        BASE_TIMESTAMP=$(echo "$LATEST_BACKUP_NAME" | sed 's/.*_inc_base-\([0-9]*\)_.*/\1/')
     fi
-
-    # Remove any trailing slash to prevent double slash issue
-    LATEST_BACKUP=$(echo "$LATEST_BACKUP" | sed 's:/$::')
-    CFG_INCREMENTAL="--incremental-basedir=$LATEST_BACKUP"
+    
+    BACKUP_OPTIONS="--incremental-basedir=$LATEST_BACKUP"
     LOCAL_BACKUP_DIR="${CFG_LOCAL_BACKUP_DIR}/${CFG_DATE}_${OPT_BACKUP_TYPE}_base-${BASE_TIMESTAMP}_${CFG_TIMESTAMP}"
-
-    if [ "$OPT_DRY_RUN" -eq 1 ]; then
-        echo "Dry run: would run incremental backup"
-        echo "Base backup: $LATEST_BACKUP"
-        echo "Original full backup timestamp: $BASE_TIMESTAMP"
-        echo "Would create: $LOCAL_BACKUP_DIR"
-        if [ "$BACKUP_TOOL" = "mariabackup" ]; then
-            echo "Command: mariabackup --backup ${CFG_INCREMENTAL} $GALERA_OPTIONS --target-dir=\"$LOCAL_BACKUP_DIR\""
-        else
-            echo "Command: xtrabackup --backup ${CFG_INCREMENTAL} $GALERA_OPTIONS --extra-lsndir=\"$LOCAL_BACKUP_DIR\" --target-dir=\"$LOCAL_BACKUP_DIR\""
-        fi
-        if [ "$OPT_NO_SYNC" -eq 1 ] || [ "$OPT_LOCAL_ONLY" -eq 1 ]; then
-            echo "Would skip S3 sync"
-        else
-            echo "Would sync to: $CFG_MC_BUCKET_PATH/$(basename "$LOCAL_BACKUP_DIR")"
-        fi
-        exit 0
-    fi
-
-    mkdir -p "$LOCAL_BACKUP_DIR"
     
-    if [ "$BACKUP_TOOL" = "mariabackup" ]; then
-        if mariabackup --backup "${CFG_INCREMENTAL}" \
-            $GALERA_OPTIONS \
-            --target-dir="$LOCAL_BACKUP_DIR"; then
-            echo "Incremental backup completed locally"
-        else
-            echo "Incremental backup failed!"
-            exit 1
-        fi
-    else
-        if xtrabackup --backup "${CFG_INCREMENTAL}" \
-            $GALERA_OPTIONS \
-            --extra-lsndir="$LOCAL_BACKUP_DIR" \
-            --target-dir="$LOCAL_BACKUP_DIR"; then
-            echo "Incremental backup completed locally"
-        else
-            echo "Incremental backup failed!"
-            exit 1
-        fi
-    fi
-    
-    if [ "$OPT_NO_SYNC" -eq 0 ] && [ "$OPT_LOCAL_ONLY" -eq 0 ]; then
-        sync_to_s3 "$LOCAL_BACKUP_DIR" "$CFG_MC_BUCKET_PATH/$(basename "$LOCAL_BACKUP_DIR")"
-    fi
-
-  ########################################################################
-  # ------------------------- Full backup -------------------------------
-  ########################################################################
-  else
+  else # Full backup
     LOCAL_BACKUP_DIR="${CFG_LOCAL_BACKUP_DIR}/${CFG_DATE}_${OPT_BACKUP_TYPE}_${CFG_TIMESTAMP}"
 
-    if [ "$OPT_DRY_RUN" -eq 1 ]; then
-        echo "Dry run: would run full backup"
-        echo "Would create: $LOCAL_BACKUP_DIR"
-        echo "Would cleanup old local backups (keeping ${CFG_LOCAL_BACKUP_KEEP_COUNT:-4})"
-        if [ "$BACKUP_TOOL" = "mariabackup" ]; then
-            echo "Command: mariabackup --backup $GALERA_OPTIONS --target-dir=\"$LOCAL_BACKUP_DIR\""
-        else
-            echo "Command: xtrabackup --backup $GALERA_OPTIONS --extra-lsndir=\"$LOCAL_BACKUP_DIR\" --target-dir=\"$LOCAL_BACKUP_DIR\""
-        fi
-        if [ "$OPT_NO_SYNC" -eq 1 ] || [ "$OPT_LOCAL_ONLY" -eq 1 ]; then
-            echo "Would skip S3 sync"
-        else
-            echo "Would sync to: $CFG_MC_BUCKET_PATH/$(basename "$LOCAL_BACKUP_DIR")"
-        fi
-        if [ "$OPT_CLEANUP" -eq 1 ] && [ "$OPT_LOCAL_ONLY" -eq 0 ]; then
-            echo "Would also prune old chains in S3"
-        fi
-        exit 0
-    fi
-
-    mkdir -p "$LOCAL_BACKUP_DIR"
-
-    # Clean up old local backups
+    # Clean up old local backups only for full backups
     KEEP_COUNT="${CFG_LOCAL_BACKUP_KEEP_COUNT:-4}"
     COUNT=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name '20*' | wc -l)
     if [ "$COUNT" -gt "$KEEP_COUNT" ]; then
       find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name '20*' | sort |
       head -n $((COUNT - KEEP_COUNT)) | while read -r OLD; do rm -rf "$OLD"; done
     fi
-
-    if [ "$BACKUP_TOOL" = "mariabackup" ]; then
-        if mariabackup --backup $GALERA_OPTIONS \
-            --target-dir="$LOCAL_BACKUP_DIR"; then
-            echo "Full backup completed locally"
-        else
-            echo "Full backup failed!"
-            exit 1
-        fi
+  fi
+  
+  # --- Dry-run or actual execution logic, now consolidated ---
+  if [ "$OPT_DRY_RUN" -eq 1 ]; then
+    echo "Dry run: would run $OPT_BACKUP_TYPE backup"
+    echo "Would create: $LOCAL_BACKUP_DIR"
+    echo "Command: $BACKUP_TOOL --backup $BACKUP_OPTIONS $GALERA_OPTIONS --target-dir=\"$LOCAL_BACKUP_DIR\""
+    if [ "$OPT_NO_SYNC" -eq 1 ] || [ "$OPT_LOCAL_ONLY" -eq 1 ]; then
+      echo "Would skip S3 sync"
     else
-        if xtrabackup --backup $GALERA_OPTIONS \
-            --extra-lsndir="$LOCAL_BACKUP_DIR" \
-            --target-dir="$LOCAL_BACKUP_DIR"; then
-            echo "Full backup completed locally"
-        else
-            echo "Full backup failed!"
-            exit 1
-        fi
+      echo "Would sync to: $CFG_MC_BUCKET_PATH/$(basename "$LOCAL_BACKUP_DIR")"
     fi
+    [ "$OPT_BACKUP_TYPE" = "full" ] && echo "Would cleanup old local backups (keeping ${KEEP_COUNT:-4})"
+    [ "$OPT_CLEANUP" -eq 1 ] && [ "$OPT_LOCAL_ONLY" -eq 0 ] && echo "Would also prune old chains in S3"
+    exit 0
+  fi
+  
+  # Actual execution
+  mkdir -p "$LOCAL_BACKUP_DIR"
+  
+  if [ "$BACKUP_TOOL" = "mariabackup" ]; then
+    if ! mariabackup --backup $BACKUP_OPTIONS $GALERA_OPTIONS --target-dir="$LOCAL_BACKUP_DIR"; then
+      echo "$OPT_BACKUP_TYPE backup failed!"
+      exit 1
+    fi
+  else # xtrabackup
+    if ! xtrabackup --backup $BACKUP_OPTIONS $GALERA_OPTIONS --extra-lsndir="$LOCAL_BACKUP_DIR" --target-dir="$LOCAL_BACKUP_DIR"; then
+      echo "$OPT_BACKUP_TYPE backup failed!"
+      exit 1
+    fi
+  fi
+  echo "$OPT_BACKUP_TYPE backup completed locally"
 
-    if [ "$OPT_NO_SYNC" -eq 0 ] && [ "$OPT_LOCAL_ONLY" -eq 0 ]; then
-        sync_to_s3 "$LOCAL_BACKUP_DIR" "$CFG_MC_BUCKET_PATH/$(basename "$LOCAL_BACKUP_DIR")"
-    fi
+  if [ "$OPT_NO_SYNC" -eq 0 ] && [ "$OPT_LOCAL_ONLY" -eq 0 ]; then
+    sync_to_s3 "$LOCAL_BACKUP_DIR" "$CFG_MC_BUCKET_PATH/$(basename "$LOCAL_BACKUP_DIR")"
   fi
 
   [ "$OPT_CLEANUP" -eq 1 ] && [ "$OPT_LOCAL_ONLY" -eq 0 ] && cleanup_old_backups
@@ -459,19 +402,9 @@ delete-chain)
 ##############################################################################
 analyze-chains) analyze_backup_chains ;;
 list)           list_backups ;;
-##############################################################################
-cleanup)
-  if [ "$OPT_LOCAL_ONLY" -eq 1 ]; then
-    echo "ERROR: --local-only cannot be used with cleanup operation" >&2
-    exit 1
-  fi
-  
-  echo "Running standalone cleanup operation..."
-  cleanup_old_backups
-  ;;
 *)
   cat <<'EOF'
-Usage: xtrabackup-s3.sh {full|inc|list|sync|sync-all|delete-chain|analyze-chains|cleanup} [OPTIONS]
+Usage: xtrabackup-s3.sh {full|inc|list|sync|sync-all|delete-chain|analyze-chains} [OPTIONS]
 
 BACKUP OPERATIONS:
   full                Create a full backup
@@ -483,7 +416,6 @@ MANAGEMENT:
   sync-all            Sync every local backup to S3
   delete-chain <full> Delete every incremental for <full>
   analyze-chains      Show backup chains / orphans
-  cleanup             Prune old backup chains in S3 based on retention settings
 
 Common options:
   --dry-run           Print every command, do nothing
