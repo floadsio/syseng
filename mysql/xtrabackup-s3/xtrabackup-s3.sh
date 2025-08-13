@@ -77,18 +77,6 @@ OPT_BACKUP_TYPE=${1:-}
 OPT_DRY_RUN=0 OPT_CLEANUP=0 OPT_NO_SYNC=0 OPT_LOCAL_ONLY=0
 BACKUP_ARGUMENTS=""
 
-# Lock file for preventing concurrent backups
-LOCK_FILE="/var/run/xtrabackup-s3.lock"
-LOCK_ACQUIRED=0
-
-# Cleanup function to remove lock on exit
-cleanup_on_exit() {
-  if [ "$LOCK_ACQUIRED" -eq 1 ]; then
-    rm -f "$LOCK_FILE"
-  fi
-}
-trap cleanup_on_exit EXIT INT TERM
-
 if [ $# -gt 0 ]; then
   shift
   while [ "$1" ]; do
@@ -145,13 +133,11 @@ sync_to_s3() {
     return 0
   fi
   
-  # Ensure all data is written to disk
   sync
   sleep 2
   
   echo "Syncing to S3: $(basename "$LOCAL_PATH")"
   
-  # Use md5 for content verification
   if mc mirror --retry --overwrite --md5 "$LOCAL_PATH" "$S3_PATH"; then
     echo "Sync completed successfully"
   else
@@ -250,6 +236,66 @@ list_backups() {
 case "$OPT_BACKUP_TYPE" in
 ##############################################################################
 full|inc)
+  
+  # --- PRE-BACKUP CLEANUP (Full Backups Only) ---
+  if [ "$OPT_BACKUP_TYPE" = "full" ]; then
+    echo "Checking disk space and performing pre-backup cleanup if needed..."
+
+    # Find the size of the latest full backup
+    LATEST_FULL_BACKUP_DIR=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name '*_full_*' | sort -r | head -1)
+    if [ -n "$LATEST_FULL_BACKUP_DIR" ] && [ -d "$LATEST_FULL_BACKUP_DIR" ]; then
+        LAST_FULL_SIZE_MB=$(du -sm "$LATEST_FULL_BACKUP_DIR" | awk '{print $1}')
+        # We add a 20% buffer to the required space for database growth
+        REQUIRED_SPACE_MB=$((LAST_FULL_SIZE_MB * 120 / 100))
+        echo "Last full backup size: ${LAST_FULL_SIZE_MB}MB. Required space for new full backup: ${REQUIRED_SPACE_MB}MB."
+    else
+        # Fallback to a hard-coded value if no previous full backup exists
+        REQUIRED_SPACE_MB=5000
+        echo "No previous full backup found. Using a default required space of 5000MB."
+    fi
+
+    OS_TYPE=$(uname -s)
+    if [ "$OS_TYPE" = "Linux" ]; then
+        AVAILABLE_SPACE_MB=$(df -m "$CFG_LOCAL_BACKUP_DIR" | tail -1 | awk '{print $4}')
+    elif [ "$OS_TYPE" = "FreeBSD" ]; then
+        AVAILABLE_SPACE_MB=$(df -k "$CFG_LOCAL_BACKUP_DIR" | tail -1 | awk '{print int($4/1024)}')
+    else
+        echo "Unsupported OS: $OS_TYPE. Cannot perform disk space check."
+        AVAILABLE_SPACE_MB=0
+    fi
+    
+    if [ "$AVAILABLE_SPACE_MB" -lt "$REQUIRED_SPACE_MB" ]; then
+        echo "WARNING: Insufficient free space (${AVAILABLE_SPACE_MB}MB < ${REQUIRED_SPACE_MB}MB). Performing pre-backup cleanup."
+        
+        # Find all full backup directories, sorted oldest to newest
+        ALL_FULL_BACKUPS=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name '*_full_*' | sort)
+        
+        # We need at least one full backup to be considered for deletion
+        if [ "$(echo "$ALL_FULL_BACKUPS" | wc -l)" -gt 1 ]; then
+            # Remove the oldest full backup and its incremental chain
+            OLD_FULL_BACKUP_DIR=$(echo "$ALL_FULL_BACKUPS" | head -1)
+            
+            echo "Removing oldest local backup: $OLD_FULL_BACKUP_DIR"
+            
+            FULL_TS=$(basename "$OLD_FULL_BACKUP_DIR" | grep -o '[0-9]*$')
+            
+            find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "*_inc_base-${FULL_TS}_*" | while read -r INC_BACKUP_DIR; do
+                echo "  - Deleting incremental: $INC_BACKUP_DIR"
+                rm -rf "$INC_BACKUP_DIR"
+            done
+            
+            rm -rf "$OLD_FULL_BACKUP_DIR"
+            echo "Cleanup complete."
+        else
+            echo "Only one full backup chain exists. Cannot clean up without losing local restore capability."
+            exit 1
+        fi
+    else
+        echo "Sufficient disk space available. Skipping pre-backup cleanup."
+    fi
+  fi
+  
+  # --- Main backup logic starts here ---
   acquire_lock
   detect_backup_tool
   mkdir -p "$CFG_LOCAL_BACKUP_DIR"
@@ -268,7 +314,7 @@ full|inc)
     done
     
     if [ -z "$LATEST_BACKUP" ]; then
-        echo "No valid backup found in $CFG_LOCAL_BACKUP_DIR with xtrabackup_checkpoints file."
+        echo "No valid backup found in $CFG_LOCAL_BACKUP_DIR with xtrabackup_check-points file."
         echo "Please run a full backup first or sync from S3."
         exit 1
     fi
@@ -285,14 +331,6 @@ full|inc)
     
   else # Full backup
     LOCAL_BACKUP_DIR="${CFG_LOCAL_BACKUP_DIR}/${CFG_DATE}_${OPT_BACKUP_TYPE}_${CFG_TIMESTAMP}"
-
-    # Clean up old local backups only for full backups
-    KEEP_COUNT="${CFG_LOCAL_BACKUP_KEEP_COUNT:-4}"
-    COUNT=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name '20*' | wc -l)
-    if [ "$COUNT" -gt "$KEEP_COUNT" ]; then
-      find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name '20*' | sort |
-      head -n $((COUNT - KEEP_COUNT)) | while read -r OLD; do rm -rf "$OLD"; done
-    fi
   fi
   
   # --- Dry-run or actual execution logic, now consolidated ---
@@ -305,7 +343,6 @@ full|inc)
     else
       echo "Would sync to: $CFG_MC_BUCKET_PATH/$(basename "$LOCAL_BACKUP_DIR")"
     fi
-    [ "$OPT_BACKUP_TYPE" = "full" ] && echo "Would cleanup old local backups (keeping ${KEEP_COUNT:-4})"
     [ "$OPT_CLEANUP" -eq 1 ] && [ "$OPT_LOCAL_ONLY" -eq 0 ] && echo "Would also prune old chains in S3"
     exit 0
   fi
