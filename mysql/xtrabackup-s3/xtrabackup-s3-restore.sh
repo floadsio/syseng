@@ -82,7 +82,7 @@ send_slack_notification() {
   HOSTNAME=$(hostname -f 2>/dev/null || hostname)
   BACKUP_HOST=$(echo "$CFG_MC_BUCKET_PATH" | sed 's|.*//||' | cut -d'/' -f1)
   BUCKET_PATH=$(echo "$CFG_MC_BUCKET_PATH" | sed 's|dcx@||')
-  BACKUP_NAME=$(echo $RESTORE_ARGUMENTS | awk '{print $1}')
+  BACKUP_NAME=$(echo "$RESTORE_ARGUMENTS" | awk '{print $1}')
   
   case "$MESSAGE_TYPE" in
     start)
@@ -159,6 +159,21 @@ EOF
       SECONDS_REMAINDER=$((TOTAL_TIME % 60))
       TIME_HUMAN="${HOURS}h ${MINUTES}m ${SECONDS_REMAINDER}s"
       
+      # Create a detailed summary from the report content
+      REPORT_SUMMARY="Full backup size: $BACKUP_SIZE\n"
+      REPORT_SUMMARY="${REPORT_SUMMARY}Full backup download took $(echo "$DETAILS" | grep 'download took' | awk '{print $5}' | head -1) seconds\n"
+      
+      # Add incremental details if it's a restore-chain
+      if [ "$OPT_RESTORE_TYPE" = "restore-chain" ]; then
+        REPORT_SUMMARY="${REPORT_SUMMARY}Incrementals applied: $INC_COUNT\n"
+        REPORT_SUMMARY="${REPORT_SUMMARY}Preparation took $(echo "$DETAILS" | grep 'Preparation took' | awk '{print $3}' | head -1) seconds\n"
+      else
+        REPORT_SUMMARY="${REPORT_SUMMARY}Preparation took $(echo "$DETAILS" | grep 'Preparation took' | awk '{print $3}' | head -1) seconds\n"
+      fi
+
+      REPORT_SUMMARY="${REPORT_SUMMARY}Copy back took $(echo "$DETAILS" | grep 'Copy back took' | awk '{print $4}' | head -1) seconds\n"
+      REPORT_SUMMARY="${REPORT_SUMMARY}Total restore time: $TIME_HUMAN"
+      
       PAYLOAD=$(cat <<EOF
 {
   "text": "✅ Database Restore Completed Successfully",
@@ -182,24 +197,9 @@ EOF
           "short": false
         },
         {
-          "title": "Source Host",
-          "value": "$BACKUP_HOST",
-          "short": true
-        },
-        {
-          "title": "Duration",
-          "value": "$TIME_HUMAN",
-          "short": true
-        },
-        {
-          "title": "Data Size",
-          "value": "$BACKUP_SIZE",
-          "short": true
-        },
-        {
-          "title": "Incrementals Applied",
-          "value": "$INC_COUNT",
-          "short": true
+          "title": "Summary",
+          "value": "$REPORT_SUMMARY",
+          "short": false
         },
         {
           "title": "Completed",
