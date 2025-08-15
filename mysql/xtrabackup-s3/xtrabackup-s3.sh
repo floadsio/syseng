@@ -33,7 +33,6 @@ trap cleanup_on_exit EXIT INT TERM
 # Function to acquire lock
 acquire_lock() {
   if [ -f "$LOCK_FILE" ]; then
-    # Check for stale lock unless it's a dry run
     if [ "$OPT_DRY_RUN" -eq 0 ] && [ -r "$LOCK_FILE" ]; then
       LOCK_PID=$(cat "$LOCK_FILE" | head -1 | awk '{print $2}')
       if [ -n "$LOCK_PID" ] && kill -0 "$LOCK_PID" 2>/dev/null; then
@@ -241,15 +240,12 @@ full|inc)
   if [ "$OPT_BACKUP_TYPE" = "full" ]; then
     echo "Checking disk space and performing pre-backup cleanup if needed..."
 
-    # Find the size of the latest full backup
     LATEST_FULL_BACKUP_DIR=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name '*_full_*' | sort -r | head -1)
     if [ -n "$LATEST_FULL_BACKUP_DIR" ] && [ -d "$LATEST_FULL_BACKUP_DIR" ]; then
         LAST_FULL_SIZE_MB=$(du -sm "$LATEST_FULL_BACKUP_DIR" | awk '{print $1}')
-        # We add a 20% buffer to the required space for database growth
         REQUIRED_SPACE_MB=$((LAST_FULL_SIZE_MB * 120 / 100))
         echo "Last full backup size: ${LAST_FULL_SIZE_MB}MB. Required space for new full backup: ${REQUIRED_SPACE_MB}MB."
     else
-        # Fallback to a hard-coded value if no previous full backup exists
         REQUIRED_SPACE_MB=5000
         echo "No previous full backup found. Using a default required space of 5000MB."
     fi
@@ -267,12 +263,9 @@ full|inc)
     if [ "$AVAILABLE_SPACE_MB" -lt "$REQUIRED_SPACE_MB" ]; then
         echo "WARNING: Insufficient free space (${AVAILABLE_SPACE_MB}MB < ${REQUIRED_SPACE_MB}MB). Performing pre-backup cleanup."
         
-        # Find all full backup directories, sorted oldest to newest
         ALL_FULL_BACKUPS=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name '*_full_*' | sort)
         
-        # We need at least one full backup to be considered for deletion
         if [ "$(echo "$ALL_FULL_BACKUPS" | wc -l)" -gt 1 ]; then
-            # Remove the oldest full backup and its incremental chain
             OLD_FULL_BACKUP_DIR=$(echo "$ALL_FULL_BACKUPS" | head -1)
             
             echo "Removing oldest local backup: $OLD_FULL_BACKUP_DIR"
@@ -356,7 +349,7 @@ full|inc)
       exit 1
     fi
   else # xtrabackup
-    if ! xtrabackup --backup $BACKUP_OPTIONS $GALERA_OPTIONS --extra-lsndir="$LOCAL_BACKUP_DIR" --target-dir="$LOCAL_BACKUP_DIR"; then
+    if ! xtrabackup --backup $BACKERA_OPTIONS --extra-lsndir="$LOCAL_BACKUP_DIR" --target-dir="$LOCAL_BACKUP_DIR"; then
       echo "$OPT_BACKUP_TYPE backup failed!"
       exit 1
     fi
