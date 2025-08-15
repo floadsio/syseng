@@ -146,7 +146,33 @@ sync_to_s3() {
 }
 
 ##############################################################################
-cleanup_old_backups() {
+cleanup_old_local_backups() {
+  KEEP_COUNT="${CFG_LOCAL_BACKUP_KEEP_COUNT:-4}"
+  echo "Pruning local backups (keeping ${KEEP_COUNT})..."
+  ALL_FULL_BACKUPS=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name '*_full_*' | sort)
+  COUNT=$(echo "$ALL_FULL_BACKUPS" | wc -l)
+  
+  if [ "$COUNT" -gt "$KEEP_COUNT" ]; then
+      echo "$((COUNT - KEEP_COUNT)) old full backup chain(s) to be removed."
+      echo "$ALL_FULL_BACKUPS" | head -n $((COUNT - KEEP_COUNT)) | while read -r OLD_FULL_BACKUP_DIR; do
+          if [ "$OPT_DRY_RUN" -eq 1 ]; then
+              echo "  [DRY-RUN] Removing local chain rooted at: $OLD_FULL_BACKUP_DIR"
+          else
+              echo "  Removing local chain rooted at: $OLD_FULL_BACKUP_DIR"
+              FULL_TS=$(basename "$OLD_FULL_BACKUP_DIR" | grep -o '[0-9]*$')
+              find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "*_inc_base-${FULL_TS}_*" | while read -r INC_BACKUP_DIR; do
+                  rm -rf "$INC_BACKUP_DIR"
+              done
+              rm -rf "$OLD_FULL_BACKUP_DIR"
+          fi
+      done
+  else
+      echo "No old local backup chains to remove."
+  fi
+}
+
+##############################################################################
+cleanup_old_s3_backups() {
   echo "Pruning old chains in S3 …"
   CUTOFF_DATE=$(date -d "$CFG_CUTOFF_DAYS days ago" +%Y-%m-%d)
   CUTOFF_NUM=$(echo "$CUTOFF_DATE" | tr -d '-')
@@ -273,7 +299,6 @@ full|inc)
             FULL_TS=$(basename "$OLD_FULL_BACKUP_DIR" | grep -o '[0-9]*$')
             
             find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "*_inc_base-${FULL_TS}_*" | while read -r INC_BACKUP_DIR; do
-                echo "  - Deleting incremental: $INC_BACKUP_DIR"
                 rm -rf "$INC_BACKUP_DIR"
             done
             
@@ -359,8 +384,11 @@ full|inc)
   if [ "$OPT_NO_SYNC" -eq 0 ] && [ "$OPT_LOCAL_ONLY" -eq 0 ]; then
     sync_to_s3 "$LOCAL_BACKUP_DIR" "$CFG_MC_BUCKET_PATH/$(basename "$LOCAL_BACKUP_DIR")"
   fi
+  
+  # New: Always perform local cleanup after a successful backup
+  cleanup_old_local_backups
 
-  [ "$OPT_CLEANUP" -eq 1 ] && [ "$OPT_LOCAL_ONLY" -eq 0 ] && cleanup_old_backups
+  [ "$OPT_CLEANUP" -eq 1 ] && [ "$OPT_LOCAL_ONLY" -eq 0 ] && cleanup_old_s3_backups
   ;;
   
 ##############################################################################
@@ -372,32 +400,15 @@ cleanup)
   fi
   
   # Local cleanup
-  KEEP_COUNT="${CFG_LOCAL_BACKUP_KEEP_COUNT:-4}"
-  echo "Pruning local backups (keeping ${KEEP_COUNT})..."
-  ALL_FULL_BACKUPS=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name '*_full_*' | sort)
-  COUNT=$(echo "$ALL_FULL_BACKUPS" | wc -l)
-  
-  if [ "$COUNT" -gt "$KEEP_COUNT" ]; then
-      echo "$((COUNT - KEEP_COUNT)) old full backup chain(s) to be removed."
-      echo "$ALL_FULL_BACKUPS" | head -n $((COUNT - KEEP_COUNT)) | while read -r OLD_FULL_BACKUP_DIR; do
-          if [ "$OPT_DRY_RUN" -eq 1 ]; then
-              echo "  [DRY-RUN] Removing local chain rooted at: $OLD_FULL_BACKUP_DIR"
-          else
-              echo "  Removing local chain rooted at: $OLD_FULL_BACKUP_DIR"
-              FULL_TS=$(basename "$OLD_FULL_BACKUP_DIR" | grep -o '[0-9]*$')
-              find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "*_inc_base-${FULL_TS}_*" | while read -r INC_BACKUP_DIR; do
-                  rm -rf "$INC_BACKUP_DIR"
-              done
-              rm -rf "$OLD_FULL_BACKUP_DIR"
-          fi
-      done
+  if [ "$OPT_LOCAL_ONLY" -eq 0 ]; then
+      cleanup_old_local_backups
   else
-      echo "No old local backup chains to remove."
+      echo "Skipping S3 cleanup (--local-only specified)."
   fi
   
   # S3 cleanup
   if [ "$OPT_LOCAL_ONLY" -eq 0 ]; then
-      cleanup_old_backups
+      cleanup_old_s3_backups
   else
       echo "Skipping S3 cleanup (--local-only specified)."
   fi
