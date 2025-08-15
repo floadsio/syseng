@@ -349,7 +349,7 @@ full|inc)
       exit 1
     fi
   else # xtrabackup
-    if ! xtrabackup --backup $BACKERA_OPTIONS --extra-lsndir="$LOCAL_BACKUP_DIR" --target-dir="$LOCAL_BACKUP_DIR"; then
+    if ! xtrabackup --backup $BACKUP_OPTIONS $GALERA_OPTIONS --extra-lsndir="$LOCAL_BACKUP_DIR" --target-dir="$LOCAL_BACKUP_DIR"; then
       echo "$OPT_BACKUP_TYPE backup failed!"
       exit 1
     fi
@@ -361,6 +361,48 @@ full|inc)
   fi
 
   [ "$OPT_CLEANUP" -eq 1 ] && [ "$OPT_LOCAL_ONLY" -eq 0 ] && cleanup_old_backups
+  ;;
+  
+##############################################################################
+cleanup)
+  echo "Starting manual cleanup..."
+  
+  if [ "$OPT_DRY_RUN" -eq 1 ]; then
+      echo "[DRY-RUN] Would perform cleanup."
+  fi
+  
+  # Local cleanup
+  KEEP_COUNT="${CFG_LOCAL_BACKUP_KEEP_COUNT:-4}"
+  echo "Pruning local backups (keeping ${KEEP_COUNT})..."
+  ALL_FULL_BACKUPS=$(find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name '*_full_*' | sort)
+  COUNT=$(echo "$ALL_FULL_BACKUPS" | wc -l)
+  
+  if [ "$COUNT" -gt "$KEEP_COUNT" ]; then
+      echo "$((COUNT - KEEP_COUNT)) old full backup chain(s) to be removed."
+      echo "$ALL_FULL_BACKUPS" | head -n $((COUNT - KEEP_COUNT)) | while read -r OLD_FULL_BACKUP_DIR; do
+          if [ "$OPT_DRY_RUN" -eq 1 ]; then
+              echo "  [DRY-RUN] Removing local chain rooted at: $OLD_FULL_BACKUP_DIR"
+          else
+              echo "  Removing local chain rooted at: $OLD_FULL_BACKUP_DIR"
+              FULL_TS=$(basename "$OLD_FULL_BACKUP_DIR" | grep -o '[0-9]*$')
+              find "$CFG_LOCAL_BACKUP_DIR" -maxdepth 1 -type d -name "*_inc_base-${FULL_TS}_*" | while read -r INC_BACKUP_DIR; do
+                  rm -rf "$INC_BACKUP_DIR"
+              done
+              rm -rf "$OLD_FULL_BACKUP_DIR"
+          fi
+      done
+  else
+      echo "No old local backup chains to remove."
+  fi
+  
+  # S3 cleanup
+  if [ "$OPT_LOCAL_ONLY" -eq 0 ]; then
+      cleanup_old_backups
+  else
+      echo "Skipping S3 cleanup (--local-only specified)."
+  fi
+  
+  echo "Manual cleanup finished."
   ;;
 
 ##############################################################################
@@ -434,13 +476,14 @@ analyze-chains) analyze_backup_chains ;;
 list)           list_backups ;;
 *)
   cat <<'EOF'
-Usage: xtrabackup-s3.sh {full|inc|list|sync|sync-all|delete-chain|analyze-chains} [OPTIONS]
+Usage: xtrabackup-s3.sh {full|inc|cleanup|list|sync|sync-all|delete-chain|analyze-chains} [OPTIONS]
 
 BACKUP OPERATIONS:
   full                Create a full backup
   inc                 Create an incremental backup
   
 MANAGEMENT:  
+  cleanup             Delete old backups (local and S3)
   list                List local & S3 backups
   sync <folder>       Sync one local backup folder to S3
   sync-all            Sync every local backup to S3
