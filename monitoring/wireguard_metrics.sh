@@ -46,7 +46,7 @@ wg show "$WG_INTERFACE" dump | tail -n +2 | awk -F'\t' -v interface="$WG_INTERFA
 
     # Sanitize values for Prometheus labels
     gsub(/[^a-zA-Z0-9.:-]/, "_", endpoint)
-    gsub(/[^a-zA-Z0-9.,:/]/, "_", allowed_ips)
+    gsub(/[^a-zA-Z0-9.,:\/]/, "_", allowed_ips)
 
     # Export peer info
     print "wireguard_peer_info{interface=\"" interface "\",public_key=\"" pubkey "\",endpoint=\"" endpoint "\",allowed_ips=\"" allowed_ips "\"} 1"
