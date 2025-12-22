@@ -344,7 +344,49 @@ full|inc)
         BASE_TIMESTAMP=$(echo "$LATEST_BACKUP_NAME" | sed 's/.*_inc_base-\([0-9]*\)_.*/\1/')
     fi
     
+    # Determine incremental backup method (page-tracking vs LSN-based)
     BACKUP_OPTIONS="--incremental-basedir=$LATEST_BACKUP"
+    USE_PAGE_TRACKING=false
+
+    # Check if page-tracking is enabled in .my.cnf
+    if [ -f /root/.my.cnf ]; then
+      # page-tracking can be:
+      # 1. A flag: "page-tracking" (no value, enabled by presence)
+      # 2. Key-value: "page-tracking=on" or "page-tracking=1" or "page-tracking=true"
+      PAGE_TRACKING_LINE=$(grep -A30 '^\[xtrabackup\]' /root/.my.cnf | \
+        grep -E '^page-tracking' | \
+        head -1 | \
+        tr -d ' \t')
+
+      if [ -n "$PAGE_TRACKING_LINE" ]; then
+        # Check if it's a flag (no = sign) or has a value
+        if [ "${PAGE_TRACKING_LINE#*=}" = "$PAGE_TRACKING_LINE" ]; then
+          # No equals sign, so it's a boolean flag (enabled)
+          USE_PAGE_TRACKING=true
+        else
+          # Has equals sign, check the value
+          PAGE_TRACKING_VALUE=$(echo "$PAGE_TRACKING_LINE" | cut -d= -f2 | tr '[:upper:]' '[:lower:]')
+          if [ "$PAGE_TRACKING_VALUE" = "on" ] || \
+             [ "$PAGE_TRACKING_VALUE" = "1" ] || \
+             [ "$PAGE_TRACKING_VALUE" = "true" ] || \
+             [ "$PAGE_TRACKING_VALUE" = "yes" ]; then
+            USE_PAGE_TRACKING=true
+          fi
+        fi
+      fi
+    fi
+
+    # Apply the appropriate backup method
+    if [ "$USE_PAGE_TRACKING" = "true" ]; then
+      BACKUP_OPTIONS=""  # Let xtrabackup use page-tracking from .my.cnf
+      echo "Page-tracking enabled - using page-tracking from .my.cnf"
+      echo "Base backup: $LATEST_BACKUP_NAME"
+    else
+      BACKUP_OPTIONS="--incremental-basedir=$LATEST_BACKUP"
+      echo "Using LSN-based incremental backup (--incremental-basedir)"
+      echo "Base directory: $LATEST_BACKUP"
+    fi
+
     LOCAL_BACKUP_DIR="${CFG_LOCAL_BACKUP_DIR}/${CFG_DATE}_${OPT_BACKUP_TYPE}_base-${BASE_TIMESTAMP}_${CFG_TIMESTAMP}"
     
   else # Full backup
