@@ -377,13 +377,13 @@ full|inc)
     fi
 
     # Apply the appropriate backup method
+    # Note: Both methods use --incremental-basedir, but page-tracking changes the scanning method
+    BACKUP_OPTIONS="--incremental-basedir=$LATEST_BACKUP"
     if [ "$USE_PAGE_TRACKING" = "true" ]; then
-      BACKUP_OPTIONS=""  # Let xtrabackup use page-tracking from .my.cnf
-      echo "Page-tracking enabled - using page-tracking from .my.cnf"
+      echo "Page-tracking enabled - scanning changes with page-tracking bitmap"
       echo "Base backup: $LATEST_BACKUP_NAME"
     else
-      BACKUP_OPTIONS="--incremental-basedir=$LATEST_BACKUP"
-      echo "Using LSN-based incremental backup (--incremental-basedir)"
+      echo "Using LSN-based incremental backup (scanning redo log)"
       echo "Base directory: $LATEST_BACKUP"
     fi
 
